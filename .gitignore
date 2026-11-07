@@ -1,0 +1,29 @@
+# Build outputs
+laptop/clipconnect
+android/build/
+android/.gradle/
+android/*.apk
+android/app/build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+/tmp/*
+
+# Docs (markdown)
+*.md
+
+# Secrets
+*.secret
+*.key
+.env
