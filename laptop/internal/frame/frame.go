@@ -7,28 +7,21 @@ import (
 )
 
 const (
-	// HeaderSize is the size of the length prefix.
 	HeaderSize = 4
-	// MaxPlaintext is the maximum plaintext size per frame (1 MiB).
 	MaxPlaintext = 1024 * 1024
-	// TagSize is the AES-GCM tag size.
 	TagSize = 16
-	// NonceSize is the GCM nonce size.
 	NonceSize = 12
 )
 
-// Codec handles encryption/decryption of frames using AES-256-GCM.
 type Codec struct {
 	ae      cipher.AEAD
 	counter uint64
 }
 
-// NewCodec creates a new frame codec.
 func NewCodec(ae cipher.AEAD) *Codec {
 	return &Codec{ae: ae}
 }
 
-// Encode encrypts a plaintext message and returns the wire frame.
 func (c *Codec) Encode(plaintext []byte) ([]byte, error) {
 	if len(plaintext) > MaxPlaintext {
 		return nil, fmt.Errorf("plaintext too large: %d bytes", len(plaintext))
@@ -38,6 +31,7 @@ func (c *Codec) Encode(plaintext []byte) ([]byte, error) {
 	binary.BigEndian.PutUint64(nonce[4:], c.counter)
 	c.counter++
 
+	// Seal returns new slice, don't pass pre-allocated output
 	ciphertext := c.ae.Seal(nil, nonce, plaintext, nil)
 
 	length := uint32(len(ciphertext))
@@ -47,7 +41,6 @@ func (c *Codec) Encode(plaintext []byte) ([]byte, error) {
 	return result, nil
 }
 
-// Decode decrypts a received frame. buf must contain [4-byte length ‖ ciphertext‖tag].
 func (c *Codec) Decode(buf []byte) ([]byte, error) {
 	if len(buf) < HeaderSize {
 		return nil, fmt.Errorf("insufficient data for frame header")

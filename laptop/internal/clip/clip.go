@@ -65,7 +65,7 @@ func IsSensitive(text string) bool {
 		"x-kde-passwordManagerHint",
 	}
 	for _, p := range sensitivePatterns {
-		if len(text) > len(p) {
+		if len(text) >= len(p) {
 			for i := 0; i <= len(text)-len(p); i++ {
 				if text[i:i+len(p)] == p {
 					return true

@@ -1,0 +1,100 @@
+{
+  "version": "v1",
+  "description": "Test vectors for ClipConnect wire protocol conformance. Generated from the real frame + crypto code.",
+  "handshake": {
+    "description": "CCN1 handshake with HKDF key derivation",
+    "secret": "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+    "clientNonce": "00112233445566778899aabbccddeeff",
+    "serverNonce": "ffeeddccbbaa99887766554433221100",
+    "expected_c2s_key": "5744dfb1714bdf85de6ddac4c35fb19ccf203e509743b10cc3bf11d9596f5a91",
+    "expected_s2c_key": "c1fba89bd700c9be1fb0dbef99c8f9ca9ccdee60cb94fe0a2a5b0b2a63a53e48",
+    "hello_c2s_ciphertext_hex": "000000239f7addbb85705fb4a6f459702a270d07cf9759612f9a34afee65f38aa40dd8df61d5c3"
+  },
+  "frame_codec": {
+    "description": "AES-256-GCM frame encoding/decoding",
+    "key": "aabbccdd00112233aabbccdd00112233aabbccdd00112233aabbccdd00112233",
+    "plaintext": "Hello, ClipConnect!",
+    "expected_frame_length": 39,
+    "expected_tag_size": 16,
+    "expected_frame_hex": "0000002342df2379cc3283442aa8322a7b0e4478fda52dc564d2deeb7350ca1f8f628dc735b225"
+  },
+  "messages": {
+    "hello": {
+      "t": "hello",
+      "v": 1
+    },
+    "clip_with_seq": {
+      "seq": 1,
+      "t": "clip",
+      "text": "test clipboard content"
+    },
+    "ack": {
+      "seq": 1,
+      "t": "ack"
+    },
+    "ping": {
+      "t": "ping"
+    },
+    "pong": {
+      "t": "pong"
+    }
+  },
+  "seq_ack": {
+    "description": "Sequence and acknowledgment protocol",
+    "test_cases": [
+      {
+        "ack_timeout_ms": 3000,
+        "clip_text": "hello world",
+        "expected_ack_seq": 1,
+        "name": "single_clip_with_ack",
+        "sender_seq": 1
+      },
+      {
+        "clips": [
+          {
+            "seq": 1,
+            "text": "first clip"
+          },
+          {
+            "seq": 2,
+            "text": "second clip"
+          },
+          {
+            "seq": 3,
+            "text": "third clip"
+          }
+        ],
+        "expected_acks": [
+          1,
+          2,
+          3
+        ],
+        "name": "multiple_clips"
+      },
+      {
+        "ack_timeout_ms": 3000,
+        "clip_text": "unacked clip",
+        "name": "missed_ack_resend",
+        "resend_after_timeout": true,
+        "sender_seq": 5
+      }
+    ]
+  },
+  "dedupe": {
+    "description": "Deduplication by SHA-256 hash",
+    "test_cases": [
+      {
+        "expected": "rejected",
+        "hash": "a636bd7cd42060a4d07fa1bfbcc010eb7794c2ba721e1e3e4c20335a15b66eaf",
+        "name": "duplicate_clip",
+        "text": "same content"
+      },
+      {
+        "expected": "accepted",
+        "hash": "9d9d56051b7344b869e54a8ecebf1b39f21fe2449222bbdd135e9a608b216738",
+        "name": "unique_clip",
+        "text": "different content"
+      }
+    ]
+  }
+}

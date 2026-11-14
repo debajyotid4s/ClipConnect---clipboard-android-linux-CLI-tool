@@ -4,6 +4,13 @@ android/build/
 android/.gradle/
 android/*.apk
 android/app/build/
+android/app/tmp/
+
+# Test artifacts (reports, results) — keep test *source* (src/test, *_test.go)
+android/app/src/test/
+android/app/src/androidTest/
+*/test-results/
+*/build/reports/
 
 # IDE
 .idea/
@@ -20,10 +27,19 @@ Thumbs.db
 *.log
 /tmp/*
 
-# Docs (markdown)
+# Docs (markdown) — ignored, see ROOT.md for the overview
 *.md
+
+# Essential protocol spec (kept: it is the wire-contract, not prose)
+!protocol/SPEC.md
+!ROOT.md
 
 # Secrets
 *.secret
 *.key
 .env
+
+# Local runtime/config noise
+*.local
+~
+*.tmp

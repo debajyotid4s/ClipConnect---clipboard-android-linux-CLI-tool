@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Backend reads and writes the system clipboard.
@@ -118,13 +119,22 @@ func (b *X11Backend) Set(ctx context.Context, text string) error {
 		args = []string{"-clipboard", "-selection", "clipboard"}
 	}
 
-	cmd := exec.CommandContext(ctx, b.tool, args...)
-	cmd.Stdin = strings.NewReader(text)
-	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("%s start: %w", b.tool, err)
+	// xclip can hang if the X clipboard owner changes or a prior instance is
+	// stuck holding the selection. Bound the write with a timeout and retry
+	// once so an incoming clip is reliably pasted.
+	for attempt := 0; attempt < 2; attempt++ {
+		cctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		cmd := exec.CommandContext(cctx, b.tool, args...)
+		cmd.Stdin = strings.NewReader(text)
+		err := cmd.Run()
+		cancel()
+		if err == nil {
+			return nil
+		}
+		// Brief pause so a retried xclip isn't blocked by a still-released lock.
+		if attempt == 0 {
+			time.Sleep(150 * time.Millisecond)
+		}
 	}
-	if err := cmd.Wait(); err != nil {
-		return fmt.Errorf("%s wait: %w", b.tool, err)
-	}
-	return nil
+	return fmt.Errorf("%s set: %w", b.tool, ctx.Err())
 }
