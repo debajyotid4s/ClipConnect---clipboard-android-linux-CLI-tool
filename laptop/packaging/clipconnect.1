@@ -1,0 +1,66 @@
+.TH CLIPCONNECT 1 "2026" "ClipConnect 1.0" "User Commands"
+.SH NAME
+clipconnect \- automated, encrypted clipboard sync between Android and Linux
+.SH SYNOPSIS
+.B clipconnect
+.br
+.B clipconnect pair
+.br
+.B clipconnect unpair
+.br
+.B clipconnect logs
+.br
+.B clipconnect help
+.br
+.B clipconnect version
+.SH DESCRIPTION
+.B ClipConnect
+syncs the clipboard bidirectionally between an Android phone and a Linux
+laptop on the same LAN. Copy text on either device and it appears on the
+other within a couple of seconds. Pairing is a one-time QR scan; everything
+after that is automatic. Traffic is end-to-end encrypted (AES-256-GCM).
+The daemon runs as the normal user under a systemd user unit and never as
+root.
+.SH COMMANDS
+.TP
+.B clipconnect
+Open the interactive keyboard menu: pair, unpair, view logs, or help.
+.TP
+.B clipconnect pair
+Generate a new pairing secret, open the firewall, restart the daemon, and
+show a QR code. Re-pairs unconditionally, revoking previously paired phones.
+.TP
+.B clipconnect unpair [--yes]
+Remove the pairing secret and disconnect. \fB\-\-yes\fR skips the prompt.
+.TP
+.B clipconnect logs [\fB\-\-follow\fR] [\fB\-\-lines\fR N]
+Show daemon logs. Clipboard plaintext and secrets are never logged.
+.TP
+.B clipconnect help
+Show installation, pairing, and troubleshooting help.
+.TP
+.B clipconnect version
+Print the version.
+.SH PORT
+The daemon listens on TCP \fB10369\fR. \fBufw\fR is opened automatically on
+first pair (one sudo prompt).
+.SH REQUIREMENTS
+.IP X11
+\fbxclip\fR or \fbxsel\fR
+.IP Wayland (wlroots / KDE)
+\fBwl-clipboard\fR (\fBwl-paste\fR / \fBwl-copy\fR)
+.IP Android
+Allow auto-launch, background running, and "no restrictions" battery for
+ClipConnect on OEM skins that kill background apps.
+.SH SECURITY
+The QR is effectively a password \fBdo not share it.\fR No telemetry, no
+analytics, no internet access.
+.SH FILES
+.TP
+.I ~/.config/clipconnect/secret
+The pairing secret (mode 0600).
+.TP
+.I /usr/lib/systemd/user/clipconnect.service
+The systemd user unit.
+.SH SEE ALSO
+The project README for the full setup and troubleshooting guide.

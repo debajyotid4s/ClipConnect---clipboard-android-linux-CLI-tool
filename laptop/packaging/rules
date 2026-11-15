@@ -1,0 +1,33 @@
+#!/bin/sh
+set -e
+
+# Build the static binary for the target arch, then lay it into the package
+# tree and install the systemd user unit + man page.
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+ROOT=$(cd "$HERE/.." && pwd)          # laptop/ (module root)
+BUILD=$(cd "$HERE/.." && pwd)/../_pkg # parent of laptop/, outside the module
+GOARCH=amd64
+
+# Build (static, cross-compiled for the host arch).
+cd "$ROOT"
+CGO_ENABLED=0 GOOS=linux GOARCH=$GOARCH go build -trimpath -ldflags "-s -w" \
+  -o "$BUILD/clipconnect" ./cmd/clipconnect
+
+# Package tree.
+PKG=$BUILD/clipconnect-pkg
+mkdir -p "$PKG/usr/bin" "$PKG/usr/lib/systemd/user" "$PKG/usr/share/man/man1"
+
+# Install the binary.
+install -m 0755 "$BUILD/clipconnect" "$PKG/usr/bin/clipconnect"
+
+# Install the systemd user unit.
+install -m 0644 "$HERE/clipconnect.service" "$PKG/usr/lib/systemd/user/clipconnect.service"
+
+# Install the man page.
+install -m 0644 "$HERE/clipconnect.1.gz" "$PKG/usr/share/man/man1/clipconnect.1.gz"
+
+# The package must not generate a secret or modify the firewall at install
+# time; that happens on first 'clipconnect pair'. No root process is started.
+
+echo "Package tree ready at $PKG"

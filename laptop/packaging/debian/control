@@ -1,0 +1,17 @@
+Source: clipconnect
+Section: utils
+Priority: optional
+Maintainer: ClipConnect Authors
+Build-Depends: golang-go (>= 1.24)
+Standards-Version: 4.19.2
+Homepage: https://github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool
+
+Package: clipconnect
+Architecture: amd64
+Depends: ${deps}, wl-clipboard | (xclip | xsel)
+Description: CLI-based automated clipboard sync between Android and Linux
+ ClipConnect syncs the clipboard bidirectionally between an Android phone
+ and a Linux laptop on the same LAN, automatically and end-to-end
+ encrypted. Copy text on either device and it appears on the other within
+ a couple of seconds. Pair once with a QR code; everything after that is
+ automatic. The daemon runs as the normal user under a systemd user unit.

@@ -7,11 +7,15 @@ android/*.apk
 android/app/build/
 android/app/tmp/
 
-# Test artifacts (reports, results) — keep test *source* (src/test, *_test.go)
+# Test artifacts (reports, results)
 android/app/src/test/
 android/app/src/androidTest/
 */test-results/
 */build/reports/
+
+# Go test files (keep non-test source)
+*_test.go
+*.test
 
 # IDE
 .idea/

@@ -7,7 +7,7 @@
 ## Transport
 
 - **Protocol:** TCP
-- **Default port:** 48123
+- **Default port:** 10369
 - **Roles:** laptop = server, phone = client (phone dials and redials)
 
 ---

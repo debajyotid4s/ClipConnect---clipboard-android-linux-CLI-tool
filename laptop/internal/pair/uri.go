@@ -60,7 +60,7 @@ func ParseURI(raw string) (*PairInfo, error) {
 
 	// p = port
 	p := q.Get("p")
-	port := 48123
+	port := 10369
 	if p != "" {
 		fmt.Sscanf(p, "%d", &port)
 	}

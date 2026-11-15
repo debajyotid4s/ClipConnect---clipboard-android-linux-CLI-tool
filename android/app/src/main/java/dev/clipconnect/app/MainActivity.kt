@@ -77,7 +77,7 @@ class MainActivity : ComponentActivity() {
             }
             val secretB64 = (uri.getQueryParameter("k") ?: "").trim()
             val host = (uri.getQueryParameter("h")?.split(",")?.firstOrNull() ?: "").trim()
-            val port = uri.getQueryParameter("p")?.toIntOrNull() ?: 48123
+            val port = uri.getQueryParameter("p")?.toIntOrNull() ?: 10369
             if (secretB64.isBlank() || host.isBlank()) return
             val b64 = secretB64.replace('-', '+').replace('_', '/')
             val padded = when (b64.length % 4) { 2 -> b64 + "=="; 3 -> b64 + "="; else -> b64 }
@@ -456,7 +456,7 @@ class MainActivity : ComponentActivity() {
         currentPort: Int
     ) {
         var host by remember { mutableStateOf(currentHost) }
-        var port by remember { mutableStateOf(if (currentPort > 0) currentPort.toString() else "48123") }
+        var port by remember { mutableStateOf(if (currentPort > 0) currentPort.toString() else "10369") }
         var secret by remember { mutableStateOf("") }
 
         AlertDialog(
@@ -497,7 +497,7 @@ class MainActivity : ComponentActivity() {
                         }
                         val decoded = android.util.Base64.decode(padded.trim(), android.util.Base64.DEFAULT)
                         if (decoded.isNotEmpty()) {
-                            onPair(host, port.toIntOrNull() ?: 48123, decoded)
+                            onPair(host, port.toIntOrNull() ?: 10369, decoded)
                         }
                     }
                 }) { Text("Pair") }
