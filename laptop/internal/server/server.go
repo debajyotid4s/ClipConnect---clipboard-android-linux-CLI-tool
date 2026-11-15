@@ -34,6 +34,7 @@ type Server struct {
 	handler Handler
 	logger  *slog.Logger
 	port    int
+	status  func([]string)
 
 	mu      sync.Mutex
 	clients map[*session.Session]bool
@@ -62,6 +63,24 @@ func (s *Server) Port() int {
 	return s.port
 }
 
+// SetStatusCallback registers a callback for daemon status changes.
+func (s *Server) SetStatusCallback(callback func([]string)) {
+	s.status = callback
+}
+
+func (s *Server) publishStatus() {
+	if s.status == nil {
+		return
+	}
+	s.mu.Lock()
+	addrs := make([]string, 0, len(s.clients))
+	for client := range s.clients {
+		addrs = append(addrs, client.RemoteAddr())
+	}
+	s.mu.Unlock()
+	s.status(addrs)
+}
+
 // Start begins listening. Returns when ctx is cancelled.
 func (s *Server) Start(ctx context.Context) error {
 	ln, err := net.Listen("tcp", s.addr)
@@ -70,8 +89,24 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	defer ln.Close()
 
+	shutdown := make(chan struct{})
+	defer close(shutdown)
+	go func() {
+		select {
+		case <-ctx.Done():
+			ln.Close()
+			s.mu.Lock()
+			for cl := range s.clients {
+				cl.Close()
+			}
+			s.mu.Unlock()
+		case <-shutdown:
+		}
+	}()
+
 	s.port, _ = portFromAddr(ln.Addr().String())
 	s.logger.Info("server listening", "addr", ln.Addr().String())
+	s.publishStatus()
 
 	var wg sync.WaitGroup
 	defer func() {
@@ -90,7 +125,7 @@ func (s *Server) Start(ctx context.Context) error {
 		default:
 		}
 
-		conn, err := ln.Accept()	// block
+		conn, err := ln.Accept() // block
 		if err != nil {
 			select {
 			case <-ctx.Done():
@@ -131,10 +166,12 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) error {
 	s.mu.Lock()
 	s.clients[sess] = true
 	s.mu.Unlock()
+	s.publishStatus()
 	defer func() {
 		s.mu.Lock()
 		delete(s.clients, sess)
 		s.mu.Unlock()
+		s.publishStatus()
 		sess.Close()
 	}()
 
@@ -157,13 +194,11 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) error {
 func (s *Server) readLoop(ctx context.Context, sess *session.Session) {
 	msgCount := 0
 
-
 	// buf := make([]byte, 1024)
 	// for {
 	// 	n, err := conn.Read(buf)
 	// 	buf = buf[n:]
 	// }
-
 
 	for {
 		sess.SetReadDeadline(time.Now().Add(45 * time.Second))
@@ -187,7 +222,7 @@ func (s *Server) readLoop(ctx context.Context, sess *session.Session) {
 				continue
 			}
 
-		// Seq/ack: track sequence number
+			// Seq/ack: track sequence number
 			s.seqMu.Lock()
 			if msg.Seq > 0 {
 				addr := sess.RemoteAddr()

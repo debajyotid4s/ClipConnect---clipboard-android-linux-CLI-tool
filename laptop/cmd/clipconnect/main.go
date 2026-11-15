@@ -10,13 +10,13 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/clip"
 	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/clip/backend"
 	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/config"
-	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/mdns"
 	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/pair"
 	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/server"
 
@@ -24,8 +24,7 @@ import (
 )
 
 const (
-	defaultPort = 48123
-	pkgName     = "dev.clipconnect.app"
+	pkgName = "dev.clipconnect.app"
 
 	// fixedPort is the single, always-on listening port for the daemon. It is
 	// persisted to disk (config.PortFile) so the QR and the phone's saved port
@@ -48,50 +47,35 @@ func newFileLogger() *slog.Logger {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		printUsage()
-		os.Exit(1)
-	}
-
-	// The daemon logger writes to a file, not the terminal: the terminal is
-	// reserved for the interactive sudo prompt and the QR code, so the two can
-	// never interleave and garble the output.
 	logger := newFileLogger()
-	switch os.Args[1] {
-	case "pair":
-		cmdPair(logger)
-	case "daemon":
-		cmdDaemon(logger)
-	case "status":
-		cmdStatus(logger)
-	case "unpair":
-		cmdUnpair()
-	case "setup-phone":
-		cmdSetupPhone()
-	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
-		printUsage()
+	if err := newRootCommand(logger).Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-}
-
-func printUsage() {
-	fmt.Fprint(os.Stderr, `Usage: clipconnect <command>
-
-Commands:
-  pair         Generate pairing secret and show QR code
-  daemon       Start the clipboard sync daemon
-  status       Show pairing and connection status
-  unpair       Remove the pairing secret
-  setup-phone  Print adb commands to set up the phone
-`)
 }
 
 func cmdPair(logger *slog.Logger) {
-	existing, _ := config.LoadSecret()
+	if err := stopDaemon(); err != nil {
+		log.Fatalf("stop daemon before pairing: %v", err)
+	}
+
+	existing, err := config.LoadSecret()
+	if err != nil {
+		log.Fatalf("load pairing secret: %v", err)
+	}
 	if existing != nil {
-		fmt.Println("Already paired. Run 'clipconnect unpair' first to re-pair.")
-		return
+		if err := config.DeleteSecret(); err != nil {
+			log.Fatalf("remove existing pairing: %v", err)
+		}
+		fmt.Println("Existing pairing removed.")
+	}
+
+	fmt.Println("Checking firewall (enter sudo password if required)…")
+	if err := ensureUfwAllow(); err != nil {
+		logger.Warn("firewall (manual steps required)", "err", err)
+		fmt.Printf("Auto-allow failed; run manually: sudo ufw allow %d/tcp\n", fixedPort)
+	} else {
+		fmt.Println("Firewall ready.")
 	}
 
 	secret, err := config.GenerateSecret()
@@ -108,7 +92,7 @@ func cmdPair(logger *slog.Logger) {
 	}
 
 	hostname, _ := os.Hostname()
-	uri := pair.BuildURI(secret, ips, defaultPort, hostname)
+	uri := pair.BuildURI(secret, ips, fixedPort, hostname)
 
 	qr, err := qrcode.New(uri, qrcode.Medium)
 	if err != nil {
@@ -123,28 +107,23 @@ func cmdPair(logger *slog.Logger) {
 	fmt.Println(uri)
 	fmt.Println()
 	fmt.Printf("LAN IPs: %s\n", strings.Join(ips, ", "))
-	fmt.Printf("Port: %d\n", defaultPort)
-	fmt.Println()
-	fmt.Println("Firewall rules:")
-	fmt.Println("  ufw: sudo ufw allow 48123/tcp")
-	fmt.Println("  firewalld: sudo firewall-cmd --add-port=48123/tcp --permanent && sudo firewall-cmd --reload")
+	fmt.Printf("Port: %d\n", fixedPort)
 }
 
 func cmdDaemon(logger *slog.Logger) {
-	// Pair only on first start: reuse the existing secret so the QR stays
-	// stable across restarts. The user changes it only via 'unpair'.
-	secret, _ := config.LoadSecret()
-	if secret == nil {
-		cmdUnpair()
-		var err error
-		secret, err = config.GenerateSecret()
-		if err != nil {
-			log.Fatalf("generate secret: %v", err)
-		}
-		if err := config.SaveSecret(secret); err != nil {
-			log.Fatalf("save secret: %v", err)
-		}
+	// Pairing owns secret generation and firewall setup. The daemon only runs
+	// after an explicit pairing has been completed.
+	secret, err := config.LoadSecret()
+	if err != nil {
+		log.Fatalf("load pairing secret: %v", err)
 	}
+	if secret == nil {
+		log.Fatal("not paired; run 'clipconnect pair' first")
+	}
+	if err := config.SavePID(os.Getpid()); err != nil {
+		log.Fatalf("save daemon pid: %v", err)
+	}
+	defer config.DeletePID()
 
 	be, err := backend.Detect()
 	if err != nil {
@@ -159,7 +138,7 @@ func cmdDaemon(logger *slog.Logger) {
 	// lastAppliedIncoming holds the most recent clip pasted INTO the OS
 	// clipboard from a phone. watchClipboard skips it so an incoming clip is
 	// never echoed back out to the phone (feedback loop).
-	var lastAppliedIncoming string
+	var lastAppliedIncoming incomingClipGuard
 
 	srv := server.New(addr, secret, func(text string) {
 		// A clip arrived from a paired phone. Paste it into the OS clipboard so
@@ -171,28 +150,27 @@ func cmdDaemon(logger *slog.Logger) {
 		logger.Info("received clip", "len", len(text))
 		// Remember what we just pasted so watchClipboard does not echo it back
 		// out to the phone (feedback loop).
-		lastAppliedIncoming = text
+		lastAppliedIncoming.Mark(text)
 	}, logger)
+	srv.SetStatusCallback(func(addrs []string) {
+		status := config.RuntimeStatus{
+			PID:       os.Getpid(),
+			Port:      fixedPort,
+			Clients:   addrs,
+			UpdatedAt: time.Now(),
+		}
+		if err := config.SaveRuntimeStatus(status); err != nil {
+			logger.Warn("save runtime status", "err", err)
+		}
+	})
+	defer config.DeleteRuntimeStatus()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	go watchClipboard(ctx, be, srv, logger, &lastAppliedIncoming)
 
-	// Start mDNS advertiser
-	ifaces := mdns.PickInterfaces()
-	hostname, _ := os.Hostname()
-	var advertiser *mdns.Advertiser
-	if adv, err := mdns.NewAdvertiser(secret, defaultPort, hostname, ifaces, logger); err != nil {
-		logger.Warn("mDNS advertisement failed, continuing without it", "err", err)
-	} else {
-		advertiser = adv
-		go advertiser.Run(ctx)
-		logger.Info("mDNS advertiser started")
-	}
-
-	// Run the server in the background so we can capture the OS-assigned port
-	// and print the pairing QR before blocking on shutdown.
+	// Run the server in the background before blocking on shutdown.
 	go func() {
 		if err := srv.Start(ctx); err != nil {
 			log.Fatalf("server: %v", err)
@@ -217,59 +195,33 @@ func cmdDaemon(logger *slog.Logger) {
 		logger.Warn("persist port", "err", err)
 	}
 
-	if advertiser != nil {
-		advertiser.AdvertisePort(port)
-	}
 	logger.Info("daemon listening", "port", port)
-
-	// Open the firewall BEFORE showing the QR, so the sudo prompt (if any) is
-	// out of the way and the QR prints cleanly on its own. A clear line marks
-	// where the password prompt will appear.
-	fmt.Println()
-	fmt.Println("Opening firewall (enter sudo password when prompted)…")
-	if err := ensureUfwAllow(); err != nil {
-		logger.Warn("firewall (manual steps required)", "err", err)
-		fmt.Printf("Auto-allow failed; run manually:  sudo ufw allow %d/tcp\n", fixedPort)
-	} else {
-		logger.Info("firewall open", "port", fixedPort)
-	}
-
-	// Build and print the pairing QR with the real IP:port+secret.
-	printPairingQR(logger, secret, port)
 
 	<-ctx.Done()
 }
 
-// printPairingQR builds a pairing URI with the live IP list and port, prints the
-// QR, and echoes the manual URI. The phone reads host + port + secret from it.
-func printPairingQR(logger *slog.Logger, secret []byte, port int) {
-	ips := lanIPs()
-	if len(ips) == 0 {
-		ips = []string{"127.0.0.1"}
-	}
-	hostname, _ := os.Hostname()
-	uri := pair.BuildURI(secret, ips, port, hostname)
-
-	qr, err := qrcode.New(uri, qrcode.Medium)
-	if err != nil {
-		log.Fatalf("generate qr: %v", err)
-	}
-
-	fmt.Println()
-	fmt.Println("Scan this QR code with the ClipConnect Android app:")
-	fmt.Println()
-	fmt.Println(qr.ToSmallString(true))
-	fmt.Println()
-	fmt.Println("Or connect manually with:")
-	fmt.Println(uri)
-	fmt.Println()
-	fmt.Printf("LAN IPs: %s\n", strings.Join(ips, ", "))
-	fmt.Printf("Port: %d\n", port)
-	fmt.Println()
-	fmt.Println("The firewall is opened automatically on first start (one sudo prompt).")
+type incomingClipGuard struct {
+	mu   sync.Mutex
+	text string
 }
 
-func watchClipboard(ctx context.Context, be backend.Backend, srv *server.Server, logger *slog.Logger, lastAppliedIncoming *string) {
+func (g *incomingClipGuard) Mark(text string) {
+	g.mu.Lock()
+	g.text = text
+	g.mu.Unlock()
+}
+
+func (g *incomingClipGuard) Consume(text string) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.text != text {
+		return false
+	}
+	g.text = ""
+	return true
+}
+
+func watchClipboard(ctx context.Context, be backend.Backend, srv *server.Server, logger *slog.Logger, lastAppliedIncoming *incomingClipGuard) {
 	guard := clip.NewGuard(100)
 	var lastClip string
 	var lastTime time.Time
@@ -305,8 +257,7 @@ func watchClipboard(ctx context.Context, be backend.Backend, srv *server.Server,
 			}
 
 			// Skip a clip we just pasted from a phone so it is not echoed back.
-			if lastAppliedIncoming != nil && text == *lastAppliedIncoming {
-				*lastAppliedIncoming = ""
+			if lastAppliedIncoming != nil && lastAppliedIncoming.Consume(text) {
 				continue
 			}
 
@@ -332,7 +283,17 @@ func cmdStatus(logger *slog.Logger) {
 		fmt.Println("Not paired. Run 'clipconnect pair' first.")
 		return
 	}
-	fmt.Println("Paired: yes")
+	pid, err := config.LoadPID()
+	if err != nil {
+		fmt.Printf("Daemon: unknown (%v)\n", err)
+		pid = 0
+	}
+	running := pid > 0 && syscall.Kill(pid, 0) == nil
+	if !running {
+		fmt.Println("Daemon: stopped")
+	} else {
+		fmt.Println("Daemon: running")
+	}
 
 	be, err := backend.Detect()
 	if err != nil {
@@ -341,23 +302,54 @@ func cmdStatus(logger *slog.Logger) {
 		fmt.Printf("Backend: %s\n", backendName(be))
 	}
 
-	fmt.Printf("Port: %d\n", defaultPort)
+	fmt.Printf("Port: %d\n", fixedPort)
 
-	conn, err := net.DialTimeout("tcp", fmt.Sprintf("localhost:%d", defaultPort), 2*time.Second)
-	if err != nil {
+	status, err := config.LoadRuntimeStatus()
+	if err != nil || !running || status.PID != pid {
 		fmt.Println("Phone connected: no")
 	} else {
-		conn.Close()
-		fmt.Println("Phone connected: yes")
+		fmt.Printf("Phone connected: %s\n", strings.Join(status.Clients, ", "))
 	}
 }
 
 func cmdUnpair() {
+	if err := stopDaemon(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not stop daemon: %v\n", err)
+	}
 	if err := config.DeleteSecret(); err != nil {
 		// Not paired yet: nothing to remove. Safe to ignore.
 		return
 	}
 	fmt.Println("Unpaired. Secret removed.")
+}
+
+func stopDaemon() error {
+	pid, err := config.LoadPID()
+	if err != nil {
+		return err
+	}
+	if pid == 0 || pid == os.Getpid() {
+		return config.DeletePID()
+	}
+
+	if err := syscall.Kill(pid, 0); err != nil {
+		if err := config.DeletePID(); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+		return fmt.Errorf("send SIGTERM to pid %d: %w", pid, err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return config.DeletePID()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("daemon pid %d did not stop", pid)
 }
 
 func cmdSetupPhone() {

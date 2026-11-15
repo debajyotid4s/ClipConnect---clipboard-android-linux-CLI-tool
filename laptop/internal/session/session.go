@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/frame"
@@ -25,17 +26,17 @@ const (
 )
 
 var (
-	infoC2S = []byte("clipconnect v1 c2s")
-	infoS2C = []byte("clipconnect v1 s2c")
+	infoC2S  = []byte("clipconnect v1 c2s")
+	infoS2C  = []byte("clipconnect v1 s2c")
 	helloMsg = []byte(`{"t":"hello","v":1}`)
 )
 
 // Message is a JSON frame message.
 type Message struct {
-	Type string  `json:"t"`
-	Text string  `json:"text,omitempty"`
-	Ver  int     `json:"v,omitempty"`
-	Seq  uint64  `json:"seq,omitempty"`
+	Type string `json:"t"`
+	Text string `json:"text,omitempty"`
+	Ver  int    `json:"v,omitempty"`
+	Seq  uint64 `json:"seq,omitempty"`
 }
 
 // Session holds an encrypted connection between two peers.
@@ -43,6 +44,8 @@ type Session struct {
 	conn net.Conn
 	recv *frame.Codec
 	send *frame.Codec
+
+	writeMu sync.Mutex
 }
 
 // NewServer performs the protocol handshake as the server and returns a ready Session.
@@ -202,6 +205,13 @@ func (s *Session) WriteMsg(msg *Message) error {
 	if err != nil {
 		return err
 	}
+
+	// Serialize encoding and socket writes together. The send codec owns the
+	// per-session nonce counter, and TCP does not preserve message boundaries
+	// when multiple goroutines write concurrently.
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+
 	enc, err := s.send.Encode(data)
 	if err != nil {
 		return err

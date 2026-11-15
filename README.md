@@ -80,7 +80,7 @@ The secret is created with restrictive permissions and remains stable across dae
 ./clipconnect pair
 ```
 
-The daemon listens on TCP port `10369`. If automatic firewall setup is unavailable, allow that port manually:
+The pairing command configures the firewall for TCP port `10369`. If automatic firewall setup is unavailable, allow that port manually:
 
 ```bash
 sudo ufw allow 10369/tcp

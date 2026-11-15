@@ -6,7 +6,7 @@ import (
 )
 
 func TestServerSeqIncrement(t *testing.T) {
-	srv := New(":48123", []byte("testsecret123456789012345678901234"), nil, nil)
+	srv := New(":10369", []byte("testsecret123456789012345678901234"), nil, nil)
 	if srv == nil {
 		t.Fatal("New() returned nil")
 	}
@@ -27,7 +27,7 @@ func TestServerSeqIncrement(t *testing.T) {
 }
 
 func TestServerClearClientSeq(t *testing.T) {
-	srv := New(":48123", []byte("testsecret123456789012345678901234"), nil, nil)
+	srv := New(":10369", []byte("testsecret123456789012345678901234"), nil, nil)
 
 	// Set sequence for a client
 	srv.seqMu.Lock()
@@ -48,7 +48,7 @@ func TestServerClearClientSeq(t *testing.T) {
 }
 
 func TestServerMultipleClientsSeq(t *testing.T) {
-	srv := New(":48123", []byte("testsecret123456789012345678901234"), nil, nil)
+	srv := New(":10369", []byte("testsecret123456789012345678901234"), nil, nil)
 
 	// Set different sequences for different clients
 	srv.seqMu.Lock()
@@ -68,7 +68,7 @@ func TestServerMultipleClientsSeq(t *testing.T) {
 }
 
 func TestServerConcurrentAccess(t *testing.T) {
-	srv := New(":48123", []byte("testsecret123456789012345678901234"), nil, nil)
+	srv := New(":10369", []byte("testsecret123456789012345678901234"), nil, nil)
 
 	var wg sync.WaitGroup
 	for i := 0; i < 10; i++ {

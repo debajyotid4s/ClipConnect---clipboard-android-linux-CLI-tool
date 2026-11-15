@@ -54,19 +54,6 @@ object Crypto {
     }
 
     /**
-     * First 4 bytes of HMAC-SHA256(secret, "mdns-id"), hex-encoded.
-     * Advertised in the mDNS TXT record; the secret itself is never advertised.
-     * Matches the laptop mdns.mdnsId.
-     */
-    fun mdnsId(secret: ByteArray): String {
-        val mac = Mac.getInstance("HmacSHA256")
-        val spec = SecretKeySpec(secret, "HmacSHA256")
-        mac.init(spec)
-        val digest = mac.doFinal("mdns-id".toByteArray(Charsets.UTF_8))
-        return digest.take(4).joinToString("") { "%02x".format(it) }
-    }
-
-    /**
      * Compute the SHA-256 hex digest of a string.
      */
     fun sha256(text: String): String {

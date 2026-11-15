@@ -26,7 +26,6 @@ import androidx.compose.ui.unit.dp
 import dev.clipconnect.app.network.TcpClient
 import dev.clipconnect.app.service.ConnectionService
 import dev.clipconnect.app.service.IncomingClipApplier
-import dev.clipconnect.app.discovery.MdnsDiscoverer
 private const val TAG = "MainActivity"
 
 class MainActivity : ComponentActivity() {
@@ -73,7 +72,7 @@ class MainActivity : ComponentActivity() {
             }
             val secretB64 = (uri.getQueryParameter("k") ?: "").trim()
             val host = (uri.getQueryParameter("h")?.split(",")?.firstOrNull() ?: "").trim()
-            val port = uri.getQueryParameter("p")?.toIntOrNull() ?: 48123
+            val port = uri.getQueryParameter("p")?.toIntOrNull() ?: 10369
             if (secretB64.isBlank() || host.isBlank()) return
             val b64 = secretB64.replace('-', '+').replace('_', '/')
             val padded = when (b64.length % 4) { 2 -> b64 + "=="; 3 -> b64 + "="; else -> b64 }
@@ -167,27 +166,6 @@ class MainActivity : ComponentActivity() {
                     activity.startConnectionService(pairing.first, pairing.second, secret)
                 }
             }
-        }
-
-        // Auto-discover the laptop over mDNS once paired, and switch the
-        // connection to the resolved address. The QR IPs remain the fallback.
-        LaunchedEffect(Unit) {
-            val pairing = activity.loadPairing()
-            if (pairing == null) return@LaunchedEffect
-            val secret = activity.loadSecret() ?: return@LaunchedEffect
-            val id = dev.clipconnect.app.crypto.Crypto.mdnsId(secret)
-            val discoverer = MdnsDiscoverer(this@MainActivity, id).apply {
-                onService = { host, port ->
-                    if (host != pairedHost) {
-                        Log.d(TAG, "mDNS discovered laptop $host:$port; reconnecting")
-                        activity.startConnectionService(host, port, secret)
-                    }
-                }
-            }
-            discoverer.start()
-            // Discovery is best-effort; keep the QR fallback alive if it times out.
-            delay(20000)
-            discoverer.stop()
         }
 
         // Outgoing sync (phone -> laptop) is fully automated: the ConnectionService
@@ -466,7 +444,7 @@ class MainActivity : ComponentActivity() {
         currentPort: Int
     ) {
         var host by remember { mutableStateOf(currentHost) }
-        var port by remember { mutableStateOf(if (currentPort > 0) currentPort.toString() else "48123") }
+        var port by remember { mutableStateOf(if (currentPort > 0) currentPort.toString() else "10369") }
         var secret by remember { mutableStateOf("") }
 
         AlertDialog(
@@ -507,7 +485,7 @@ class MainActivity : ComponentActivity() {
                         }
                         val decoded = android.util.Base64.decode(padded.trim(), android.util.Base64.DEFAULT)
                         if (decoded.isNotEmpty()) {
-                            onPair(host, port.toIntOrNull() ?: 48123, decoded)
+                            onPair(host, port.toIntOrNull() ?: 10369, decoded)
                         }
                     }
                 }) { Text("Pair") }

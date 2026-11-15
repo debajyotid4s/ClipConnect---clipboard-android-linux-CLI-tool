@@ -3,7 +3,9 @@ package pair
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -39,12 +41,18 @@ func ParseURI(raw string) (*PairInfo, error) {
 
 	// k = secret (base64url, no padding)
 	k := q.Get("k")
+	if k == "" {
+		return nil, fmt.Errorf("missing secret")
+	}
 	secret := make([]byte, base64URLEncodedLen(len(k)))
 	decoded, err := base64URLDecode(secret, k)
 	if err != nil {
 		return nil, fmt.Errorf("decode secret: %w", err)
 	}
 	secret = decoded
+	if len(secret) != 32 {
+		return nil, fmt.Errorf("invalid secret length: got %d bytes, want 32", len(secret))
+	}
 
 	// h = IPs (comma-separated)
 	h := q.Get("h")
@@ -53,16 +61,25 @@ func ParseURI(raw string) (*PairInfo, error) {
 		for _, ip := range strings.Split(h, ",") {
 			ip = strings.TrimSpace(ip)
 			if ip != "" {
+				if net.ParseIP(ip) == nil || net.ParseIP(ip).To4() == nil {
+					return nil, fmt.Errorf("invalid IPv4 address: %s", ip)
+				}
 				ips = append(ips, ip)
 			}
 		}
 	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("missing host IP")
+	}
 
 	// p = port
 	p := q.Get("p")
-	port := 48123
-	if p != "" {
-		fmt.Sscanf(p, "%d", &port)
+	if p == "" {
+		return nil, fmt.Errorf("missing port")
+	}
+	port, err := strconv.Atoi(p)
+	if err != nil || port != 10369 {
+		return nil, fmt.Errorf("invalid port: %s", p)
 	}
 
 	// n = hostname
@@ -79,10 +96,13 @@ func ParseURI(raw string) (*PairInfo, error) {
 
 // BuildURI creates a pairing URI from the given info.
 func BuildURI(secret []byte, ips []string, port int, hostname string) string {
-	k := base64URLEncode(secret)
-	h := strings.Join(ips, ",")
-	return fmt.Sprintf("clipconnect://pair?v=1&k=%s&h=%s&p=%d&n=%s",
-		k, h, port, hostname)
+	q := url.Values{}
+	q.Set("v", "1")
+	q.Set("k", base64URLEncode(secret))
+	q.Set("h", strings.Join(ips, ","))
+	q.Set("p", strconv.Itoa(port))
+	q.Set("n", hostname)
+	return "clipconnect://pair?" + q.Encode()
 }
 
 // base64URLEncode encodes bytes to base64url without padding.

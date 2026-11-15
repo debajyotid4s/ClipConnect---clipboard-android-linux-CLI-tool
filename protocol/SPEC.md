@@ -7,7 +7,7 @@
 ## Transport
 
 - **Protocol:** TCP
-- **Default port:** 48123
+- **Fixed port:** 10369
 - **Roles:** laptop = server, phone = client (phone dials and redials)
 
 ---
@@ -21,20 +21,14 @@
 ### QR payload
 
 ```
-clipconnect://pair?v=1&k=<base64url secret>&h=<ip1,ip2>&p=48123&n=<hostname>
+clipconnect://pair?v=1&k=<base64url secret>&h=<ip1,ip2>&p=10369&n=<hostname>
 ```
 
 - `v` — protocol version (1)
 - `k` — base64url-encoded secret (no padding)
-- `h` — comma-separated private LAN IPs (fallback if mDNS fails)
+- `h` — comma-separated private LAN IPs to try in order
 - `p` — port
 - `n` — laptop hostname
-
-### mDNS
-
-- Service name: `_clipconnect._tcp`
-- TXT record: `id=<first 4 bytes of HMAC-SHA256(secret, "mdns-id"), hex>`
-- The secret is never advertised.
 
 ---
 
