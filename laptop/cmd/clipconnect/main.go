@@ -68,6 +68,8 @@ func main() {
 		cmdUnpair()
 	case "setup-phone":
 		cmdSetupPhone()
+	case "tui":
+		cmdTUI(logger)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		printUsage()
@@ -84,6 +86,7 @@ Commands:
   status       Show pairing and connection status
   unpair       Remove the pairing secret
   setup-phone  Print adb commands to set up the phone
+  tui          Show an interactive dashboard over the running daemon
 `)
 }
 
@@ -414,4 +417,60 @@ func backendName(be backend.Backend) string {
 	default:
 		return "unknown"
 	}
+}
+
+// cmdTUI launches the interactive dashboard over the running daemon. It pairs
+// the live server with the bubbletea model and feeds it status snapshots.
+func cmdTUI(logger *slog.Logger) {
+	secret, err := config.LoadSecret()
+	if err != nil {
+		log.Fatalf("load secret: %v", err)
+	}
+	if secret == nil {
+		fmt.Println("Not paired. Run 'clipconnect pair' first.")
+		return
+	}
+
+	be, err := backend.Detect()
+	if err != nil {
+		log.Fatalf("detect backend: %v", err)
+	}
+	logger.Info("using backend", "type", backendName(be))
+
+	addr := fmt.Sprintf("0.0.0.0:%d", fixedPort)
+	srv := server.New(addr, secret, func(string) {}, logger)
+
+	// Grab the pairing URI (and thus the QR body) using the live IP list.
+	ips := lanIPs()
+	if len(ips) == 0 {
+		ips = []string{"127.0.0.1"}
+	}
+	hostname, _ := os.Hostname()
+	uri := pair.BuildURI(secret, ips, fixedPort, hostname)
+
+	qr, err := qrcode.New(uri, qrcode.Medium)
+	if err != nil {
+		log.Fatalf("generate qr: %v", err)
+	}
+
+	// Start the server in the background so Port()/ClientCount() become live.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		if err := srv.Start(ctx); err != nil {
+			logger.Error("server", "err", err)
+		}
+	}()
+
+	// Poll for the bound port (fixedPort) before launching the TUI so the
+	// Overview shows the correct port immediately.
+	port := 0
+	for port == 0 {
+		port = srv.Port()
+		time.Sleep(20 * time.Millisecond)
+	}
+	_ = config.SavePort(fixedPort)
+
+	logger.Info("tui: daemon listening", "port", port)
+	runTUI(srv, true, qr.ToSmallString(true))
 }

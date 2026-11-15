@@ -58,15 +58,5 @@
             </intent-filter>
         </receiver>
 
-        <!-- Test-only: sets the system clipboard from a broadcast, so the
-             outgoing sync path can be exercised deterministically over ADB. -->
-        <receiver
-            android:name=".TestClipboardReceiver"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="dev.clipconnect.app.SET_CLIP" />
-            </intent-filter>
-        </receiver>
-
     </application>
 </manifest>

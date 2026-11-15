@@ -3,11 +3,15 @@ package dev.clipconnect.app.service
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.ClipboardManager
 import android.os.IBinder
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import dev.clipconnect.app.R
 import dev.clipconnect.app.bridge.ClipboardIpcClient
@@ -43,6 +47,15 @@ class ConnectionService : Service() {
         @Volatile
         var currentClient: TcpClient? = null
             private set
+
+        // Emits connection state so the UI can observe it via a StateFlow instead
+        // of polling a static holder on the main thread.
+        private val _connectionState = MutableStateFlow(false)
+        val connectionState = _connectionState.asStateFlow()
+
+        fun markConnected(value: Boolean) {
+            _connectionState.value = value
+        }
     }
 
     private val tcpClient = TcpClient()
@@ -57,6 +70,14 @@ class ConnectionService : Service() {
     private var ipcClient: ClipboardIpcClient? = null
     private var lastClipHash: String? = null
     private val pollLock = Any()
+
+    // Event-driven outgoing path. When the user copies something, the system
+    // fires this callback almost immediately (far faster than the fallback poll
+    // and immune to MIUI's "stale for a cycle" read). The poll below remains as
+    // a safety net in case the listener is suppressed while the app is
+    // backgrounded (MIUI/HyperOS behaviour varies by vendor).
+    private var clipboardManager: ClipboardManager? = null
+    private var primaryClipListener: ClipboardManager.OnPrimaryClipChangedListener? = null
 
     // This service manages both directions:
     //  - incoming (laptop -> phone): applied by IncomingClipApplier
@@ -80,7 +101,13 @@ class ConnectionService : Service() {
             tcpClient.setConfig(host, port, secret)
             if (!isRunning) {
                 isRunning = true
-                sync = ClipboardSync(this, tcpClient).apply { attachIncoming() }
+                sync = ClipboardSync(this, tcpClient).apply {
+                    attachIncoming()
+                    onConnected = {
+                        resetOutgoingDedupe()
+                        markConnected(true)
+                    }
+                }
                 tcpClient.start()
                 startOutgoingPoll()
             }
@@ -99,9 +126,11 @@ class ConnectionService : Service() {
      */
     private fun startOutgoingPoll() {
         if (pollThread != null) return
+        clipboardManager = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         val server = ClipboardIpcServer(PORT) { readPhoneClipboard() }
         ipcServer = if (server.start() > 0) server else null
         ipcClient = ClipboardIpcClient(PORT)
+        registerClipboardListener()
         pollThread = Thread({
             while (!Thread.currentThread().isInterrupted) {
                 try {
@@ -117,6 +146,61 @@ class ConnectionService : Service() {
             }
         }).apply { name = "clip-poll"; isDaemon = true; start() }
         Log.d(TAG, "outgoing poll started (${POLL_MS}ms)")
+    }
+
+    /**
+     * Listen for clipboard changes and push any new clip to the laptop the
+     * instant it happens. Runs on the main thread, so it only queues work; the
+     * actual read+send happens here directly (fast path) and is deduped by
+     * [sendIfChanged]. We skip clips we just applied from the laptop to avoid
+     * an echo loop.
+     */
+    private fun registerClipboardListener() {
+        val mgr = clipboardManager ?: return
+        val listener = object : ClipboardManager.OnPrimaryClipChangedListener {
+            override fun onPrimaryClipChanged() {
+                // Read once; on MIUI the first read after a copy can be stale,
+                // so retry a couple of times before giving up.
+                val text = readWithRetries()
+                if (!text.isNullOrEmpty()) {
+                    sendIfChanged(text)
+                }
+            }
+        }
+        try {
+            mgr.addPrimaryClipChangedListener(listener)
+            primaryClipListener = listener
+            Log.d(TAG, "primary-clip listener registered")
+        } catch (e: Throwable) {
+            Log.e(TAG, "failed to register primary-clip listener: ${e.message}")
+        }
+    }
+
+    /** Read the clipboard, retrying briefly to survive MIUI's slow settle. */
+    private fun readWithRetries(): String? {
+        for (i in 0 until 4) {
+            val text = try {
+                val clip = clipboardManager?.getPrimaryClip()
+                if (clip == null || clip.itemCount != 1) null else clip.getItemAt(0)?.text?.toString()
+            } catch (e: Throwable) {
+                null
+            }
+            if (!text.isNullOrEmpty()) return text
+            try {
+                Thread.sleep(150)
+            } catch (e: InterruptedException) {
+                break
+            }
+        }
+        return null
+    }
+
+    /**
+     * Called on connect/disconnect so the outgoing dedupe does not carry a stale
+     * hash across a reconnect (which would silently drop the next real clip).
+     */
+    private fun resetOutgoingDedupe() {
+        synchronized(pollLock) { lastClipHash = null }
     }
 
     /** Read the current primary text clip via the public ClipboardManager API. */
@@ -154,6 +238,7 @@ class ConnectionService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        markConnected(false)
         isRunning = false
         sync?.stop()
         sync = null
@@ -187,7 +272,8 @@ class ConnectionService : Service() {
             .setContentText("Clipboard sync active")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setOngoing(true)
-            .setPriority(android.app.Notification.PRIORITY_LOW)
+            .setPriority(android.app.Notification.PRIORITY_HIGH)
+            .setShowWhen(false)
         return builder.build()
     }
 }

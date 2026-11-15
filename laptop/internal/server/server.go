@@ -59,6 +59,8 @@ func New(addr string, secret []byte, handler Handler, logger *slog.Logger) *Serv
 
 // Port returns the actual listening port. Valid after Start returns.
 func (s *Server) Port() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	return s.port
 }
 
@@ -70,7 +72,9 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	defer ln.Close()
 
+	s.mu.Lock()
 	s.port, _ = portFromAddr(ln.Addr().String())
+	s.mu.Unlock()
 	s.logger.Info("server listening", "addr", ln.Addr().String())
 
 	var wg sync.WaitGroup

@@ -18,6 +18,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
@@ -26,6 +29,7 @@ import androidx.compose.ui.unit.dp
 import dev.clipconnect.app.network.TcpClient
 import dev.clipconnect.app.service.ConnectionService
 import dev.clipconnect.app.service.IncomingClipApplier
+import dev.clipconnect.app.setup.MiUiSetup
 import dev.clipconnect.app.discovery.MdnsDiscoverer
 private const val TAG = "MainActivity"
 
@@ -152,6 +156,9 @@ class MainActivity : ComponentActivity() {
         var tcpClient by remember { mutableStateOf<TcpClient?>(null) }
         var syncing by remember { mutableStateOf(false) }
 
+        // Single coroutine scope for off-main clipboard work. Cancelled on stop.
+        val uiScope = remember { CoroutineScope(Dispatchers.Main) }
+
         // Load saved pairing on first composition
         LaunchedEffect(Unit) {
             val pairing = activity.loadPairing()
@@ -207,8 +214,11 @@ class MainActivity : ComponentActivity() {
                         Log.d(TAG, "UI: Disconnected: $reason")
                     }
                     override fun onMessage(text: String) {
-                        // Apply the laptop clip to the system clipboard (echo-guarded)
-                        IncomingClipApplier.apply(this@MainActivity, text)
+                        // Apply the laptop clip to the system clipboard (echo-guarded).
+                        // Run off the main thread so clipboard IPC never stalls UI.
+                        uiScope.launch(Dispatchers.IO) {
+                            IncomingClipApplier.apply(this@MainActivity, text)
+                        }
                         Log.d(TAG, "Received clip from laptop: ${text.length} chars")
                     }
                     override fun onError(error: String) {
@@ -249,35 +259,27 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Read TcpClient from ConnectionService static holder (no binding needed)
+        // Observe connection state from the service via StateFlow (no main-thread
+        // polling). The service flips this on connect/disconnect on its own threads.
         val context = LocalContext.current
         var clientAcquired by remember { mutableStateOf(false) }
+
         LaunchedEffect(clientAcquired) {
-            val client = ConnectionService.currentClient
-            if (client != null && !clientAcquired) {
+            val client = ServiceHolder.currentClient
+            if (client != null) {
                 tcpClient = client
                 Log.d(TAG, "Acquired TcpClient from ConnectionService holder (connected=${client.isConnected})")
                 clientAcquired = true
-            } else if (!clientAcquired) {
-                Log.d(TAG, "ConnectionService not yet started, will retry")
-                // Poll until service is available
-                for (i in 0 until 20) {
-                    delay(500)
-                    val retry = ConnectionService.currentClient
-                    if (retry != null) {
-                        tcpClient = retry
-                        Log.d(TAG, "Acquired TcpClient from ConnectionService holder (retry, connected=${retry.isConnected})")
-                        clientAcquired = true
-                        break
-                    }
-                }
             }
-            // Check if the acquired client is already connected
-            tcpClient?.let { c ->
-                if (c.isConnected) {
+        }
+
+        // Collect the service's connection StateFlow off the main thread, then
+        // flip UI state on the main dispatcher. Never blocks on IO.
+        LaunchedEffect(Unit) {
+            ServiceHolder.connectionState.collect { connected ->
+                if (connected) {
                     connectionStatus = "Connected"
-                    Log.d(TAG, "UI: Connected (client already connected)")
-                    IncomingClipApplier.attach(IncomingClipApplier())
+                    Log.d(TAG, "UI: Connected (via StateFlow)")
                 }
             }
         }
@@ -382,55 +384,43 @@ class MainActivity : ComponentActivity() {
                     }
                 }
 
-                // Setup checklist
+                // Setup checklist — state + deep-link + App-info fallback.
+                // Re-checked every app start via MiUiSetup.rows().
+                val setupRows = MiUiSetup.rows(activity)
                 Card(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
                     Column(modifier = Modifier.padding(16.dp)) {
-                        Text("Setup Checklist", style = MaterialTheme.typography.titleMedium)
+                        Text("Survival Checklist (MIUI/HyperOS)", style = MaterialTheme.typography.titleMedium)
                         Spacer(modifier = Modifier.height(8.dp))
-
-                        val notificationCheck = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                            "✓"
-                        } else {
-                            "✗"
-                        }
-                        Text("$notificationCheck Notification permission")
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                            Text("  → Tap to request", style = MaterialTheme.typography.bodySmall)
-                            TextButton(onClick = { checkNotificationPermission = true }) {
-                                Text("Request")
-                            }
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        val networkCheck = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                            "✓"
-                        } else {
-                            "✗"
-                        }
-                        Text("$networkCheck Local network permission (Android 17+)")
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-                            Text("  → Tap to request", style = MaterialTheme.typography.bodySmall)
-                            TextButton(onClick = { checkLocalNetwork = true }) {
-                                Text("Request")
-                            }
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-
-                        val batteryCheck = if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-                            "✓"
-                        } else {
-                            val pm = activity.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
-                            if (pm.isIgnoringBatteryOptimizations(activity.packageName)) "✓" else "✗"
-                        }
-                        Text("$batteryCheck Battery optimization exempt")
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                            val pm = activity.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
-                            if (!pm.isIgnoringBatteryOptimizations(activity.packageName)) {
-                                Text("  → Tap to exempt", style = MaterialTheme.typography.bodySmall)
-                                TextButton(onClick = { batteryPromptShown = true }) {
-                                    Text("Exempt")
+                        Text(
+                            "Keep these on so the connection survives background and reboot.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(modifier = Modifier.height(8.dp))
+                        for (row in setupRows) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    if (row.ok) "✓ " else "✗ ",
+                                    color = if (row.ok) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodyMedium
+                                )
+                                Text(row.label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
+                                if (!row.ok && row.intent != null) {
+                                    TextButton(onClick = {
+                                        try {
+                                            activity.startActivity(row.intent)
+                                        } catch (e: Throwable) {
+                                            Log.d(TAG, "deep-link failed: ${e.message}")
+                                        }
+                                    }) { Text("Open") }
+                                } else if (!row.ok) {
+                                    Text("manual", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                             }
+                            Spacer(modifier = Modifier.height(4.dp))
                         }
                     }
                 }
@@ -517,4 +507,14 @@ class MainActivity : ComponentActivity() {
             }
         )
     }
+}
+
+/**
+ * Thin accessor so composables can read the service's client and connection
+ * StateFlow without importing the Service class (avoids a circular import and
+ * keeps the UI layer decoupled from the Service singleton).
+ */
+object ServiceHolder {
+    val currentClient: TcpClient? get() = ConnectionService.currentClient
+    val connectionState get() = ConnectionService.connectionState
 }

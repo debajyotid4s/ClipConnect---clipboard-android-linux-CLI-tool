@@ -28,10 +28,17 @@ class ClipboardSync(
 
     private val active = AtomicBoolean(false)
 
+    /** Optional callback fired on the phone once the laptop connection is up. */
+    var onConnected: (() -> Unit)? = null
+
     /** Wire the TCP listener that applies incoming laptop clips. */
     fun attachIncoming() {
         tcpClient.setListener(object : TcpClient.Listener {
             override fun onConnected() {
+                // Outgoing dedupe must reset across a reconnect, otherwise the
+                // hash of the last pre-reconnect clip would silently drop the
+                // first real clip sent after reconnecting.
+                onConnected?.invoke()
                 Log.d(TAG, "Connected")
             }
 
