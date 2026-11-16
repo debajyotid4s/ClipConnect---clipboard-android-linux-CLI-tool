@@ -1,6 +1,7 @@
 # Build outputs
 laptop/laptop/
 laptop/clipconnect
+_pkg/
 android/build/
 android/.gradle/
 android/*.apk
@@ -16,6 +17,9 @@ android/app/src/androidTest/
 # Go test files (keep non-test source)
 *_test.go
 *.test
+
+# Kotlin test files (keep non-test source)
+*Test*.kt
 
 # IDE
 .idea/

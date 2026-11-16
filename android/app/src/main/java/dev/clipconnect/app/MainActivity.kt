@@ -21,19 +21,19 @@ import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import dev.clipconnect.app.network.TcpClient
 import dev.clipconnect.app.service.ConnectionService
 import dev.clipconnect.app.service.IncomingClipApplier
+import dev.clipconnect.app.network.TcpClient
 import dev.clipconnect.app.setup.MiUiSetup
-import dev.clipconnect.app.discovery.MdnsDiscoverer
 private const val TAG = "MainActivity"
 
 class MainActivity : ComponentActivity() {
+    // Bound service connections, tracked so they can be unbound on destroy.
+    private val bindConnections = mutableListOf<android.content.ServiceConnection>()
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
@@ -59,6 +59,14 @@ class MainActivity : ComponentActivity() {
                 handlePairingUri(uri.toString())
             }
         }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        for (c in bindConnections) {
+            try { unbindService(c) } catch (e: Throwable) { /* already unbound */ }
+        }
+        bindConnections.clear()
     }
 
     private fun handlePairingUri(uriStr: String) {
@@ -112,6 +120,11 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Bind to the ConnectionService to obtain the shared TcpClient. The service
+     * is the single owner of the network connection; binding lets the Activity
+     * observe the listener without a static holder.
+     */
     private fun stopConnectionService() {
         val intent = Intent(this, ConnectionService::class.java)
         stopService(intent)
@@ -165,6 +178,7 @@ class MainActivity : ComponentActivity() {
             if (pairing != null) {
                 pairedHost = pairing.first
                 pairedPort = pairing.second
+                connectionStatus = "Connecting…"
             }
 
             // Start connection service if paired
@@ -176,58 +190,13 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Auto-discover the laptop over mDNS once paired, and switch the
-        // connection to the resolved address. The QR IPs remain the fallback.
-        LaunchedEffect(Unit) {
-            val pairing = activity.loadPairing()
-            if (pairing == null) return@LaunchedEffect
-            val secret = activity.loadSecret() ?: return@LaunchedEffect
-            val id = dev.clipconnect.app.crypto.Crypto.mdnsId(secret)
-            val discoverer = MdnsDiscoverer(this@MainActivity, id).apply {
-                onService = { host, port ->
-                    if (host != pairedHost) {
-                        Log.d(TAG, "mDNS discovered laptop $host:$port; reconnecting")
-                        activity.startConnectionService(host, port, secret)
-                    }
-                }
-            }
-            discoverer.start()
-            // Discovery is best-effort; keep the QR fallback alive if it times out.
-            delay(20000)
-            discoverer.stop()
-        }
+        // mDNS discovery was removed: the phone connects to the IP shown on the
+        // laptop QR (or the manual field) and reconnects via TcpClient's built-in
+        // backoff. No background discovery thread.
 
         // Outgoing sync (phone -> laptop) is fully automated: the ConnectionService
         // polls the clipboard via an in-process IPC server every ~800ms and sends
         // changed clips to the laptop. No manual launch or tap is required.
-        // Bind to ConnectionService to get the real TcpClient
-        LaunchedEffect(tcpClient) {
-            tcpClient?.let { client ->
-                client.setListener(object : TcpClient.Listener {
-                    override fun onConnected() {
-                        connectionStatus = "Connected"
-                        IncomingClipApplier.attach(IncomingClipApplier())
-                        Log.d(TAG, "UI: Connected")
-                    }
-                    override fun onDisconnected(reason: String) {
-                        connectionStatus = "Disconnected: $reason"
-                        Log.d(TAG, "UI: Disconnected: $reason")
-                    }
-                    override fun onMessage(text: String) {
-                        // Apply the laptop clip to the system clipboard (echo-guarded).
-                        // Run off the main thread so clipboard IPC never stalls UI.
-                        uiScope.launch(Dispatchers.IO) {
-                            IncomingClipApplier.apply(this@MainActivity, text)
-                        }
-                        Log.d(TAG, "Received clip from laptop: ${text.length} chars")
-                    }
-                    override fun onError(error: String) {
-                        connectionStatus = "Error: $error"
-                        Log.e(TAG, "UI: Error: $error")
-                    }
-                })
-            }
-        }
 
         // Request notification permission (Android 13+)
         if (checkNotificationPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -259,28 +228,65 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        // Observe connection state from the service via StateFlow (no main-thread
-        // polling). The service flips this on connect/disconnect on its own threads.
+        // Bind to the ConnectionService to receive its TcpClient and wire the
+        // listener once. The service is the single owner of the network
+        // connection; the Activity only observes and applies incoming clips.
         val context = LocalContext.current
-        var clientAcquired by remember { mutableStateOf(false) }
 
-        LaunchedEffect(clientAcquired) {
-            val client = ServiceHolder.currentClient
-            if (client != null) {
-                tcpClient = client
-                Log.d(TAG, "Acquired TcpClient from ConnectionService holder (connected=${client.isConnected})")
-                clientAcquired = true
+        LaunchedEffect(Unit) {
+            val svcConnection = object : android.content.ServiceConnection {
+                override fun onServiceConnected(
+                    name: android.content.ComponentName,
+                    service: android.os.IBinder
+                ) {
+                    val binder = service as ConnectionService.LocalBinder
+                    val svc = binder.getService()
+                    val client = svc.tcpClientForBinding()
+                    tcpClient = client
+                    client.setListener(object : TcpClient.Listener {
+                        override fun onConnected() {
+                            connectionStatus = "Connected"
+                            IncomingClipApplier.attach(IncomingClipApplier())
+                            Log.d(TAG, "UI: Connected")
+                        }
+                        override fun onDisconnected(reason: String) {
+                            connectionStatus = "Disconnected: $reason"
+                            Log.d(TAG, "UI: Disconnected: $reason")
+                        }
+                        override fun onMessage(text: String) {
+                            uiScope.launch(Dispatchers.IO) {
+                                IncomingClipApplier.apply(this@MainActivity, text)
+                            }
+                            Log.d(TAG, "Received clip from laptop: ${text.length} chars")
+                        }
+                        override fun onError(error: String) {
+                            connectionStatus = "Error: $error"
+                            Log.e(TAG, "UI: Error: $error")
+                        }
+                    })
+                    // Reflect current connection state immediately (covers the
+                    // case where we bound after already being connected).
+                    if (client.isConnected) {
+                        connectionStatus = "Connected"
+                        IncomingClipApplier.attach(IncomingClipApplier())
+                    }
+                    Log.d(TAG, "Bound TcpClient (connected=${client.isConnected})")
+                }
+                override fun onServiceDisconnected(name: android.content.ComponentName) {
+                    connectionStatus = "Disconnected: service unbound"
+                }
             }
+            bindService(Intent(this@MainActivity, ConnectionService::class.java), svcConnection, Context.MODE_PRIVATE)
+            bindConnections += svcConnection
         }
 
-        // Collect the service's connection StateFlow off the main thread, then
-        // flip UI state on the main dispatcher. Never blocks on IO.
+        // Single source of truth for the status label: collect the service's
+        // connection StateFlow. This is robust to listener-attach timing — even
+        // if onConnected()/onDisconnected() fire before or after we bind, the
+        // status always reflects what the service actually reports.
         LaunchedEffect(Unit) {
-            ServiceHolder.connectionState.collect { connected ->
-                if (connected) {
-                    connectionStatus = "Connected"
-                    Log.d(TAG, "UI: Connected (via StateFlow)")
-                }
+            ConnectionService.connectionState.collect { connected ->
+                connectionStatus = if (connected) "Connected" else "Disconnected"
             }
         }
 
@@ -509,12 +515,3 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/**
- * Thin accessor so composables can read the service's client and connection
- * StateFlow without importing the Service class (avoids a circular import and
- * keeps the UI layer decoupled from the Service singleton).
- */
-object ServiceHolder {
-    val currentClient: TcpClient? get() = ConnectionService.currentClient
-    val connectionState get() = ConnectionService.connectionState
-}

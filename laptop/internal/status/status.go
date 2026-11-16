@@ -23,13 +23,6 @@ type Source interface {
 	Snapshot() Status
 }
 
-// ServerLike is the subset of *server.Server the status source needs. It is
-// satisfied by internal/server.Server.
-type ServerLike interface {
-	Port() int
-	ClientCount() int
-}
-
 // FromServer builds a Source that reads live state from a running daemon.
 func FromServer(s ServerLike, paired bool, port int) Source {
 	return &serverSource{srv: s, paired: paired, port: port}

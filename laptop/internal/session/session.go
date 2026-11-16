@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/frame"
@@ -43,6 +44,11 @@ type Session struct {
 	conn net.Conn
 	recv *frame.Codec
 	send *frame.Codec
+
+	// writeMu serializes concurrent writers (server Send, sendAck, pingLoop)
+	// so the AES-GCM counter nonce and the TCP frame stream are never
+	// interleaved or advanced out of order.
+	writeMu sync.Mutex
 }
 
 // NewServer performs the protocol handshake as the server and returns a ready Session.
@@ -196,8 +202,13 @@ func (s *Session) ReadMsg() (*Message, error) {
 	return &msg, nil
 }
 
-// WriteMsg sends one encrypted message through the session.
+// WriteMsg sends one encrypted message through the session. It is safe for
+// concurrent use: the mutex serializes encode + write so multiple writers
+// (server Send, sendAck, pingLoop) cannot interleave frames or race the
+// AES-GCM counter nonce.
 func (s *Session) WriteMsg(msg *Message) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err

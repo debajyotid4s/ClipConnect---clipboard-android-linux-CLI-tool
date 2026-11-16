@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.ClipboardManager
 import android.os.IBinder
+import android.os.Binder
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -44,10 +45,6 @@ class ConnectionService : Service() {
 
         private const val TAG = "ConnectionService"
 
-        @Volatile
-        var currentClient: TcpClient? = null
-            private set
-
         // Emits connection state so the UI can observe it via a StateFlow instead
         // of polling a static holder on the main thread.
         private val _connectionState = MutableStateFlow(false)
@@ -57,6 +54,13 @@ class ConnectionService : Service() {
             _connectionState.value = value
         }
     }
+
+    // Binder exposed to bound clients (the Activity) so it can read the TcpClient.
+    // The service is the single owner of the network connection.
+    inner class LocalBinder : Binder() {
+        fun getService(): ConnectionService = this@ConnectionService
+    }
+    private val binder = LocalBinder()
 
     private val tcpClient = TcpClient()
     private var isRunning = false
@@ -69,6 +73,13 @@ class ConnectionService : Service() {
     private var ipcServer: ClipboardIpcServer? = null
     private var ipcClient: ClipboardIpcClient? = null
     private var lastClipHash: String? = null
+    // Hash of the clipboard content we last OBSERVED (read), tracked separately
+    // from [lastClipHash] (the last thing we SENT). This lets us tell a genuine
+    // clipboard change apart from spurious onPrimaryClipChanged callbacks that
+    // fire on app focus/switch and re-read an unchanged clipboard. Without this,
+    // switching into the app would set the send slot to a stale value and drop
+    // the next real clip.
+    private var lastReadHash: String? = null
     private val pollLock = Any()
 
     // Event-driven outgoing path. When the user copies something, the system
@@ -111,8 +122,6 @@ class ConnectionService : Service() {
                 tcpClient.start()
                 startOutgoingPoll()
             }
-            // Make client available to MainActivity without binding
-            currentClient = tcpClient
         }
         return START_STICKY
     }
@@ -159,8 +168,11 @@ class ConnectionService : Service() {
         val mgr = clipboardManager ?: return
         val listener = object : ClipboardManager.OnPrimaryClipChangedListener {
             override fun onPrimaryClipChanged() {
-                // Read once; on MIUI the first read after a copy can be stale,
-                // so retry a couple of times before giving up.
+                // readWithRetries updates lastReadHash and returns null when the
+                // clipboard content is unchanged from what we last observed. This
+                // ignores spurious callbacks that fire on app focus/switch (which
+                // re-read an unchanged clipboard), so switching into the app can
+                // no longer pollute the send slot and drop the next real clip.
                 val text = readWithRetries()
                 if (!text.isNullOrEmpty()) {
                     sendIfChanged(text)
@@ -176,23 +188,48 @@ class ConnectionService : Service() {
         }
     }
 
-    /** Read the clipboard, retrying briefly to survive MIUI's slow settle. */
+    /**
+     * Read the clipboard, retrying briefly to survive MIUI's slow settle.
+     *
+     * Updates [lastReadHash] to the content we last observed. Callers use that to
+     * tell a genuine clipboard change apart from spurious onPrimaryClipChanged
+     * callbacks (which fire on app focus/switch and re-read an unchanged
+     * clipboard). A stale re-read of already-observed content returns null here
+     * so it never reaches the send path.
+     */
     private fun readWithRetries(): String? {
-        for (i in 0 until 4) {
+        for (i in 0 until 6) {
             val text = try {
                 val clip = clipboardManager?.getPrimaryClip()
                 if (clip == null || clip.itemCount != 1) null else clip.getItemAt(0)?.text?.toString()
             } catch (e: Throwable) {
                 null
             }
-            if (!text.isNullOrEmpty()) return text
-            try {
-                Thread.sleep(150)
-            } catch (e: InterruptedException) {
-                break
+            if (text.isNullOrEmpty()) {
+                yield150()
+                continue
             }
+            val hash = Crypto.sha256(text)
+            val alreadyObserved = synchronized(pollLock) { hash == lastReadHash }
+            if (alreadyObserved) {
+                // Same content we already read/forwarded: a stale or focus-triggered
+                // re-read. Keep retrying in case a newer copy is settling, but do
+                // NOT advance lastReadHash past it.
+                yield150()
+                continue
+            }
+            synchronized(pollLock) { lastReadHash = hash }
+            return text
         }
         return null
+    }
+
+    private fun yield150() {
+        try {
+            Thread.sleep(150)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
     }
 
     /**
@@ -200,7 +237,10 @@ class ConnectionService : Service() {
      * hash across a reconnect (which would silently drop the next real clip).
      */
     private fun resetOutgoingDedupe() {
-        synchronized(pollLock) { lastClipHash = null }
+        synchronized(pollLock) {
+            lastClipHash = null
+            lastReadHash = null
+        }
     }
 
     /** Read the current primary text clip via the public ClipboardManager API. */
@@ -219,13 +259,9 @@ class ConnectionService : Service() {
 
     /** Send a clip only if its content differs from the last one we sent. */
     private fun sendIfChanged(text: String) {
-        if (text.isBlank()) return
-        val hash = Crypto.sha256(text)
-        synchronized(pollLock) {
-            if (hash == lastClipHash) return
-            lastClipHash = hash
-        }
-        val client = currentClient
+        if (!OutgoingDedupe.isNew(text, lastClipHash)) return
+        synchronized(pollLock) { lastClipHash = Crypto.sha256(text) }
+        val client = tcpClient
         if (client == null || !client.isConnected) return
         val seq = client.sendClip(text)
         if (seq == 0L) {
@@ -235,7 +271,10 @@ class ConnectionService : Service() {
         }
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onBind(intent: Intent?): IBinder? = binder
+
+    /** Exposed to bound clients (the Activity) to read the shared TcpClient. */
+    fun tcpClientForBinding(): TcpClient = tcpClient
 
     override fun onDestroy() {
         markConnected(false)
@@ -249,7 +288,6 @@ class ConnectionService : Service() {
         pollThread?.interrupt()
         pollThread = null
         tcpClient.disconnect()
-        currentClient = null
         stopForeground(STOP_FOREGROUND_REMOVE)
         super.onDestroy()
     }

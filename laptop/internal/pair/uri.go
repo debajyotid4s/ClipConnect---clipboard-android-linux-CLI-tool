@@ -3,7 +3,9 @@ package pair
 import (
 	"encoding/base64"
 	"fmt"
+	"net"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -16,7 +18,19 @@ type PairInfo struct {
 	Hostname string
 }
 
-// ParseURI parses a clipconnect://pair URI and returns pairing info.
+const (
+	// supportedVersion is the only wire version this build understands.
+	supportedVersion = 1
+	// secretLen is the required length (bytes) of the pairing secret.
+	secretLen = 32
+	// defaultPort is used only when a URI omits the port; real URIs always
+	// carry p=10369.
+	defaultPort = 10369
+)
+
+// ParseURI parses a clipconnect://pair URI and returns pairing info. It enforces
+// version 1, a 32-byte secret, a valid port in [1,65535], and at least one valid
+// IP address. It builds the query with url.Values so host/IP data is escaped.
 func ParseURI(raw string) (*PairInfo, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -31,81 +45,93 @@ func ParseURI(raw string) (*PairInfo, error) {
 
 	q := u.Query()
 
-	// v = version
-	v := q.Get("v")
-	if v != "1" {
-		return nil, fmt.Errorf("unsupported version: %s", v)
+	// v = version: must be exactly 1.
+	if q.Get("v") != strconv.Itoa(supportedVersion) {
+		return nil, fmt.Errorf("unsupported version: %q", q.Get("v"))
 	}
 
-	// k = secret (base64url, no padding)
-	k := q.Get("k")
-	secret := make([]byte, base64URLEncodedLen(len(k)))
-	decoded, err := base64URLDecode(secret, k)
+	// k = secret (base64url, no padding): must decode to exactly 32 bytes.
+	secret, err := decodeSecret(q.Get("k"))
 	if err != nil {
 		return nil, fmt.Errorf("decode secret: %w", err)
 	}
-	secret = decoded
+	if len(secret) != secretLen {
+		return nil, fmt.Errorf("secret length = %d, want %d", len(secret), secretLen)
+	}
 
-	// h = IPs (comma-separated)
-	h := q.Get("h")
-	var ips []string
-	if h != "" {
-		for _, ip := range strings.Split(h, ",") {
-			ip = strings.TrimSpace(ip)
-			if ip != "" {
-				ips = append(ips, ip)
-			}
+	// h = IPs (comma-separated): must contain at least one valid IP.
+	ips, err := parseIPs(q.Get("h"))
+	if err != nil {
+		return nil, err
+	}
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("no valid IPs")
+	}
+
+	// p = port: must parse to a valid port; fall back to default only if absent.
+	port := defaultPort
+	if p := q.Get("p"); p != "" {
+		port, err = strconv.Atoi(p)
+		if err != nil || port < 1 || port > 65535 {
+			return nil, fmt.Errorf("invalid port: %q", p)
 		}
 	}
 
-	// p = port
-	p := q.Get("p")
-	port := 10369
-	if p != "" {
-		fmt.Sscanf(p, "%d", &port)
-	}
-
-	// n = hostname
-	n2 := q.Get("n")
-
 	return &PairInfo{
-		Version:  1,
+		Version:  supportedVersion,
 		Secret:   secret,
 		IPs:      ips,
 		Port:     port,
-		Hostname: n2,
+		Hostname: q.Get("n"),
 	}, nil
 }
 
-// BuildURI creates a pairing URI from the given info.
+// BuildURI creates a pairing URI from the given info. The query is built with
+// url.Values so the secret, IPs, and hostname are properly escaped.
 func BuildURI(secret []byte, ips []string, port int, hostname string) string {
-	k := base64URLEncode(secret)
-	h := strings.Join(ips, ",")
-	return fmt.Sprintf("clipconnect://pair?v=1&k=%s&h=%s&p=%d&n=%s",
-		k, h, port, hostname)
+	v := url.Values{}
+	v.Set("v", strconv.Itoa(supportedVersion))
+	v.Set("k", encodeSecret(secret))
+	v.Set("h", strings.Join(ips, ","))
+	v.Set("p", strconv.Itoa(port))
+	v.Set("n", hostname)
+	return "clipconnect://pair?" + v.Encode()
 }
 
-// base64URLEncode encodes bytes to base64url without padding.
-func base64URLEncode(src []byte) string {
-	encoded := base64.URLEncoding.EncodeToString(src)
-	return strings.TrimRight(encoded, "=")
+// encodeSecret base64url-encodes bytes without padding.
+func encodeSecret(src []byte) string {
+	return strings.TrimRight(base64.URLEncoding.EncodeToString(src), "=")
 }
 
-// base64URLEncodedLen returns the decoded length of a base64url-encoded string.
-func base64URLEncodedLen(encodedLen int) int {
-	return encodedLen * 6 / 8
-}
-
-// base64URLDecode decodes a base64url-encoded string (no padding).
-func base64URLDecode(dst []byte, src string) ([]byte, error) {
-	// Add padding
+// decodeSecret base64url-decodes a no-padding string to bytes.
+func decodeSecret(src string) ([]byte, error) {
+	if src == "" {
+		return nil, fmt.Errorf("empty secret")
+	}
 	padding := len(src) % 4
 	if padding != 0 {
 		src += strings.Repeat("=", 4-padding)
 	}
-	n, err := base64.URLEncoding.Decode(dst, []byte(src))
+	dec, err := base64.URLEncoding.DecodeString(src)
 	if err != nil {
 		return nil, err
 	}
-	return dst[:n], nil
+	return dec, nil
+}
+
+// parseIPs splits a comma-separated host list and keeps only valid IP literals.
+func parseIPs(s string) ([]string, error) {
+	var ips []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		ip := net.ParseIP(part)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid IP: %q", part)
+		}
+		ips = append(ips, part)
+	}
+	return ips, nil
 }

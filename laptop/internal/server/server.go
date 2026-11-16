@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"crypto/sha256"
 	"fmt"
 	"log/slog"
 	"net"
@@ -15,6 +14,10 @@ import (
 
 // Handler is called when a clip message is received.
 type Handler func(text string)
+
+// OnEstablished is an optional callback invoked once per successfully
+// established session (after handshake + hello). It may be nil.
+type OnEstablished func(addr string)
 
 // portFromAddr extracts the port from a "host:port" address string.
 func portFromAddr(addr string) (int, error) {
@@ -32,16 +35,19 @@ type Server struct {
 	addr    string
 	secret  []byte
 	handler Handler
+	onEstablished OnEstablished
 	logger  *slog.Logger
 	port    int
 
-	mu      sync.Mutex
+	// ln is stored so Start can close it on shutdown, which unblocks Accept()
+	// (a plain ctx cancel does not stop a blocking Accept).
+	ln   net.Listener
+	mu   sync.Mutex
 	clients map[*session.Session]bool
 
-	// Per-client seq tracking and deduplication
-	seqMu      sync.Mutex
-	clientSeq  map[string]uint64
-	seenHashes map[string]bool // dedup: hash -> true
+	// Per-client seq tracking
+	seqMu     sync.Mutex
+	clientSeq map[string]uint64
 }
 
 // New creates a new server.
@@ -53,8 +59,12 @@ func New(addr string, secret []byte, handler Handler, logger *slog.Logger) *Serv
 		logger:     logger,
 		clients:    make(map[*session.Session]bool),
 		clientSeq:  make(map[string]uint64),
-		seenHashes: make(map[string]bool),
 	}
+}
+
+// SetOnEstablished registers the per-session callback. Safe to call before Start.
+func (s *Server) SetOnEstablished(f OnEstablished) {
+	s.onEstablished = f
 }
 
 // Port returns the actual listening port. Valid after Start returns.
@@ -64,18 +74,26 @@ func (s *Server) Port() int {
 	return s.port
 }
 
-// Start begins listening. Returns when ctx is cancelled.
+// Start begins listening. Returns when ctx is cancelled or the listener is
+// closed via Close.
 func (s *Server) Start(ctx context.Context) error {
 	ln, err := net.Listen("tcp", s.addr)
 	if err != nil {
 		return fmt.Errorf("listen: %w", err)
 	}
-	defer ln.Close()
 
 	s.mu.Lock()
+	s.ln = ln
 	s.port, _ = portFromAddr(ln.Addr().String())
 	s.mu.Unlock()
 	s.logger.Info("server listening", "addr", ln.Addr().String())
+
+	defer func() {
+		s.mu.Lock()
+		s.ln = nil
+		s.mu.Unlock()
+		ln.Close()
+	}()
 
 	var wg sync.WaitGroup
 	defer func() {
@@ -88,20 +106,16 @@ func (s *Server) Start(ctx context.Context) error {
 	}()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-
-		conn, err := ln.Accept()	// block
+		conn, err := ln.Accept()
 		if err != nil {
+			// Shutdown path: listener closed or ctx cancelled.
 			select {
 			case <-ctx.Done():
 				return nil
 			default:
-				s.logger.Error("accept", "err", err)
-				continue
+				// Accept error for another reason (e.g. listener closed by
+				// Close); report it rather than looping.
+				return fmt.Errorf("accept: %w", err)
 			}
 		}
 
@@ -119,6 +133,19 @@ func (s *Server) Start(ctx context.Context) error {
 			}
 		}()
 	}
+}
+
+// Close stops the listener, unblocking Accept() so Start returns. It is safe to
+// call multiple times and from another goroutine (e.g. a signal handler).
+func (s *Server) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln == nil {
+		return nil
+	}
+	err := s.ln.Close()
+	s.ln = nil
+	return err
 }
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) error {
@@ -143,6 +170,10 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) error {
 	}()
 
 	s.logger.Info("session established", "addr", conn.RemoteAddr())
+
+	if s.onEstablished != nil {
+		s.onEstablished(conn.RemoteAddr().String())
+	}
 
 	// Use context for signaling shutdown
 	ctx, cancel := context.WithCancel(ctx)
@@ -197,17 +228,6 @@ func (s *Server) readLoop(ctx context.Context, sess *session.Session) {
 				addr := sess.RemoteAddr()
 				s.clientSeq[addr] = msg.Seq
 			}
-			// Dedup by hash
-			hash := sha256.Sum256([]byte(msg.Text))
-			hashStr := fmt.Sprintf("%x", hash[:])
-			if s.seenHashes[hashStr] {
-				s.logger.Info("duplicate clip (by hash), skipping", "addr", sess.RemoteAddr(), "seq", msg.Seq)
-				s.seqMu.Unlock()
-				// Still send ack
-				s.sendAck(sess, msg.Seq)
-				continue
-			}
-			s.seenHashes[hashStr] = true
 			s.seqMu.Unlock()
 
 			if s.handler != nil {
@@ -284,4 +304,19 @@ func (s *Server) ClientCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.clients)
+}
+
+// ClientAddrs returns the remote addrs of connected clients. An empty slice
+// means no phone is connected.
+func (s *Server) ClientAddrs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.clients) == 0 {
+		return nil
+	}
+	addrs := make([]string, 0, len(s.clients))
+	for cl := range s.clients {
+		addrs = append(addrs, cl.RemoteAddr())
+	}
+	return addrs
 }

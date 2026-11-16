@@ -82,6 +82,11 @@ func PortFile() string {
 	return filepath.Join(SecretDir(), "port")
 }
 
+// StateFile returns the path of the daemon's live status state file.
+func StateFile() string {
+	return filepath.Join(SecretDir(), "status.json")
+}
+
 // LoadPort reads the persisted TCP port. Returns (0, nil) if none is stored or
 // the stored value is invalid.
 func LoadPort() (int, error) {

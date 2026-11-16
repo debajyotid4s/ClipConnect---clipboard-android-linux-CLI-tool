@@ -17,7 +17,7 @@ Copy text on one device → it appears on the other within ~1 second, with no ma
 ## What works
 
 - **Pairing:** `clipconnect pair` generates a QR (IP + fixed port + secret). The phone pairs by scanning the QR or by manual entry (IP + secret). Secret is generated once and persisted (`~/.config/clipconnect/secret`, mode `0600`), so the QR stays stable across restarts.
-- **Fixed port:** the daemon always binds `0.0.0.0:10369` and persists the port so the QR and the phone's saved port stay in lockstep across restarts and fresh installs.
+- **Fixed port:** the daemon always binds `0.0.0.0:10369` (hardcoded; see `pairingFixedPort()`). The stale `port` file under `~/.config/clipconnect/` is legacy metadata and is **not** read at runtime.
 - **Laptop → Phone (incoming):** the daemon polls the laptop clipboard every 500 ms and sends each new clip. The phone's `TcpClient` read loop delivers clips; `IncomingClipApplier` writes them to the system clipboard (echo-guarded). **Verified working.**
 - **Phone → Laptop (outgoing):** the app runs an in-process IPC server (`ClipboardIpcServer`, loopback TCP `127.0.0.1:39876`) that reads the phone clipboard via the public `ClipboardManager` API. A `ClipboardManager.OnPrimaryClipChangedListener` fires on every copy and sends the changed clip immediately (deduped by SHA-256); an 800 ms poll thread (`ConnectionService`) remains as a fallback in case MIUI suppresses the listener while backgrounded. **Verified working** (frames received by the daemon, `received clip` logged).
 - **Handshake & encryption:** CCN1 handshake with HKDF-derived keys, AES-256-GCM with a per-message counter nonce, echo guard to prevent feedback loops. Conformance test vectors live in `protocol/vectors.json`.
@@ -79,7 +79,118 @@ go test ./...
 # Android (from android/)
 ./gradlew testDebugUnitTest
 ./gradlew assembleDebug
-
-# Run the daemon (prints QR, opens ufw once)
-./clipconnect daemon
 ```
+
+### Daemon
+
+The daemon is a long-running background service. It binds `0.0.0.0:10369`, polls the
+laptop clipboard, and talks to paired phones.
+
+```bash
+# Run in the foreground (blocks; Ctrl+C to stop)
+./clipconnect daemon
+
+# Run in the background
+nohup ./clipconnect daemon > /tmp/clipconnect.out 2>&1 &
+
+# Check it is listening
+ss -ltnp | grep 10369
+```
+
+### Logs
+
+The daemon writes to `~/.config/clipconnect/daemon.log` (mode `0600`). It never logs
+clipboard plaintext, secrets, or the full pairing URI — only event names, lengths, and
+addresses.
+
+```bash
+# Follow live
+tail -f ~/.config/clipconnect/daemon.log
+
+# Last N lines
+tail -n 50 ~/.config/clipconnect/daemon.log
+
+# Only handshake / connection events
+grep -iE "handshake|new connection|session established|read error" ~/.config/clipconnect/daemon.log
+
+# Only dedupe drops (clips the laptop refused because it already saw the hash)
+grep -i "duplicate" ~/.config/clipconnect/daemon.log
+```
+
+Key log lines to recognise:
+- `new connection` → a device connected.
+- `session established` → handshake + key derivation succeeded.
+- `read msg type=clip` → a clip was received (and, unless a duplicate, applied).
+- `handshake err=... message authentication failed` → **secret mismatch**: the phone is
+  using a different secret than the laptop. Re-pair (see below).
+- `duplicate clip (by hash), skipping` → the laptop already had this clip's hash and
+  skipped it. Normal if you re-copy the same text; unexpected for genuinely new clips.
+
+### Pairing
+
+Pairing regenerates the secret and prints a fresh QR. The phone scans it (or enters the
+IP + secret manually).
+
+```bash
+# Generate a QR + open the firewall (ufw allow 10369/tcp, once)
+./clipconnect pair
+
+# Same, but print each step to stderr for troubleshooting
+./clipconnect pair --verbose
+```
+
+The secret is persisted at `~/.config/clipconnect/secret` (mode `0600`). **Every `pair`
+call regenerates it**, so a phone paired with an older QR will fail its handshake until
+it re-scans. If a phone is stuck on "Connecting…", re-scan the current QR.
+
+### Unpairing
+
+```bash
+# Remove the stored secret so no device can reconnect
+./clipconnect unpair
+```
+
+### Status
+
+Report pairing and connection state without printing clipboard data or secrets. Reads
+the daemon's live status file (`~/.config/clipconnect/status.json`) plus pairing and
+systemd state.
+
+```bash
+./clipconnect status
+```
+
+```
+ClipConnect status
+==================
+Paired:            yes
+Daemon running:    yes
+Listen port:       10369
+Phones connected:  1
+  - 192.168.0.106:48036
+Last connected:    Mon, 16 Nov 2026 21:13:14 +06
+Daemon uptime:     34s
+```
+
+The daemon writes the status file every 2 s (client count, phone IPs, last-connect
+time, uptime). If systemd reports the daemon as not running, connection info is
+cleared so `status` never reports stale data.
+
+### Troubleshooting a stuck / mismatched pairing
+
+If the phone shows "Connecting…" forever and the daemon logs
+`handshake err=... message authentication failed`, the phone's stored secret no longer
+matches the laptop's. Clear the phone's stored pairing and re-scan:
+
+```bash
+# On the laptop (phone drops all credentials, reconnects fresh on next scan)
+./clipconnect unpair
+
+# On the phone: clear app data so the stale secret is wiped, then re-pair
+adb shell pm clear dev.clipconnect.app
+adb shell am force-stop dev.clipconnect.app
+# Open the app → Pair → Scan QR (regenerate with `./clipconnect pair` first)
+```
+
+Confirm success in the daemon log: `new connection` → `session established` →
+`read msg type=clip` with **no** `handshake err` and **no** `duplicate clip`.
