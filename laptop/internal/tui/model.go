@@ -76,7 +76,6 @@ func NewModel(statusCh <-chan statusMsg, qr string, logs string, paired bool) mo
 		case s := <-statusCh:
 			m.status = *s.status
 		default:
-			m.status = statusSnapshot{paired: paired}
 		}
 	} else {
 		m.status = statusSnapshot{paired: paired}
@@ -167,18 +166,4 @@ func (m model) activate() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	return m, nil
-}
-
-// View renders the current tab with Lip Gloss styling.
-func (m model) View() string {
-	switch m.tab {
-	case tabPair:
-		return m.viewPair()
-	case tabLogs:
-		return m.viewLogs()
-	case tabHelp:
-		return m.viewHelp()
-	default:
-		return m.viewMain()
-	}
 }

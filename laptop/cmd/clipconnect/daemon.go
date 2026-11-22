@@ -3,10 +3,8 @@ package main
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"syscall"
 	"time"
 
@@ -33,6 +31,8 @@ func init() {
 	rootCmd.AddCommand(daemonCmd)
 }
 
+// runDaemon starts the sync server, the clipboard watcher, and the status
+// refresh loop, then blocks until an interrupt/TERM signal.
 func runDaemon() error {
 	secret, err := config.LoadSecret()
 	if err != nil {
@@ -68,7 +68,7 @@ func runDaemon() error {
 	// statusManager exposes the daemon's live connection state (client count,
 	// phone IPs, last connect time, uptime) via a JSON file that the `status`
 	// subcommand and TUI read. It never stores clipboard data or secrets.
-	started := time.Now()
+	started := timeNow()
 	statusMgr := status.NewManager(srv, started)
 	statusMgr.SetPaired(true)
 	statusMgr.SetDaemonRunning(service.IsActive())
@@ -83,25 +83,7 @@ func runDaemon() error {
 
 	// Refresh the status file periodically so external readers see a fresh
 	// client count / phone IP / uptime.
-	go func() {
-		ticker := time.NewTicker(2 * time.Second)
-		defer ticker.Stop()
-		// Write an initial snapshot immediately.
-		if _, err := statusMgr.Refresh(); err != nil {
-			fmt.Fprintf(os.Stderr, "status write: %v\n", err)
-		}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				statusMgr.SetDaemonRunning(service.IsActive())
-				if _, err := statusMgr.Refresh(); err != nil {
-					fmt.Fprintf(os.Stderr, "status write: %v\n", err)
-				}
-			}
-		}
-	}()
+	go refreshStatus(ctx, statusMgr)
 
 	go func() {
 		if startErr := srv.Start(ctx); startErr != nil {
@@ -122,59 +104,21 @@ func runDaemon() error {
 	return nil
 }
 
-// pairingFixedPort returns the fixed daemon port.
-func pairingFixedPort() int { return 10369 }
-
-// newDaemonLogger returns a slog logger writing to the daemon log file (never
-// the terminal), so logs never mix with the QR/prompt and never contain
-// clipboard plaintext or secrets.
-func newDaemonLogger() *slog.Logger {
-	path := filepath.Join(config.SecretDir(), "daemon.log")
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
-	if err != nil {
-		return slog.New(slog.NewTextHandler(os.Stderr, nil))
-	}
-	return slog.New(slog.NewTextHandler(f, nil))
-}
-
-// watchClipboard polls the OS clipboard and sends changed clips to paired phones.
-// echoGuard is shared with the incoming handler so a clip applied from the
-// laptop (phone side) is not echoed back; clip.Guard is mutex-protected and safe
-// to share across goroutines.
-func watchClipboard(ctx context.Context, be backend.Backend, srv *server.Server, echoGuard *clip.Guard) {
-	var lastClip string
-	var lastTime time.Time
-
-	ticker := time.NewTicker(500 * time.Millisecond)
+// refreshStatus writes the status file on a 2s tick until shutdown.
+func refreshStatus(ctx context.Context, mgr *status.Manager) {
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
-
+	if _, err := mgr.Refresh(); err != nil {
+		fmt.Fprintf(os.Stderr, "status write: %v\n", err)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case t := <-ticker.C:
-			text, err := be.Get(ctx)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "clipboard get: %v\n", err)
-				continue
-			}
-			if clip.IsEmptyOrTooLarge(text) || clip.IsSensitive(text) {
-				continue
-			}
-			if t.Sub(lastTime) < 150*time.Millisecond {
-				continue
-			}
-			// Echo guard: skip a clip the laptop just applied to this machine.
-			if echoGuard.Record(text) {
-				continue
-			}
-			if text == lastClip {
-				continue
-			}
-			lastClip = text
-			lastTime = t
-			if sendErr := srv.Send(text); sendErr != nil {
-				fmt.Fprintf(os.Stderr, "send clip: %v\n", sendErr)
+		case <-ticker.C:
+			mgr.SetDaemonRunning(service.IsActive())
+			if _, err := mgr.Refresh(); err != nil {
+				fmt.Fprintf(os.Stderr, "status write: %v\n", err)
 			}
 		}
 	}

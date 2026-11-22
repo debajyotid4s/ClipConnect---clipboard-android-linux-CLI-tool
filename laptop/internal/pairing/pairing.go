@@ -1,23 +1,14 @@
-// Package pairing implements the "pair a device" workflow: stop any running
-// daemon, replace (or create) the pairing secret, open the firewall for the
-// fixed port, and restart the daemon so a fresh QR is valid immediately.
-//
-// It never logs the secret, the full pairing URI, or clipboard data — only
-// lengths and event names.
 package pairing
 
 import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"net"
 	"os"
 	"strings"
 
 	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/config"
-	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/firewall"
 	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/pair"
-	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/service"
 	"github.com/skip2/go-qrcode"
 )
 
@@ -58,14 +49,11 @@ func Pair(ctx context.Context) (*Result, error) {
 	}
 
 	// 3. LAN IPs for the QR payload (fallback if mDNS fails).
-	ips := lanIPs()
-	if len(ips) == 0 {
-		ips = []string{"127.0.0.1"}
-	}
+	ips := LanIPsForDisplay()
 	hostname, _ := os.Hostname()
 
 	// 4. Open the firewall (idempotent; prompts for sudo once if needed).
-	fwOK, fwMsg := ensureFirewall()
+	fwOK, fwMsg := OpenFirewallResult()
 
 	// 5. Build the QR and manual URI.
 	uri := pair.BuildURI(secret, ips, FixedPort, hostname)
@@ -84,87 +72,6 @@ func Pair(ctx context.Context) (*Result, error) {
 		FirewallOK:   fwOK,
 		FirewallMsg:  fwMsg,
 	}, nil
-}
-
-// StartDaemon (re)starts the user service so the fresh secret is live.
-func StartDaemon() error {
-	if _, err := service.Run(service.Start); err != nil {
-		return fmt.Errorf("start service: %w", err)
-	}
-	return nil
-}
-
-// LanIPsForDisplay returns the private LAN IPs for the QR payload, or
-// 127.0.0.1 if none are found. Exported so the CLI can echo them.
-func LanIPsForDisplay() []string {
-	ips := lanIPs()
-	if len(ips) == 0 {
-		return []string{"127.0.0.1"}
-	}
-	return ips
-}
-
-// OpenFirewall opens ufw for the fixed port (idempotent). It returns nil on
-// success, or an error describing how to open it manually.
-func OpenFirewall() error {
-	if err := firewall.UFWAllow(FixedPort); err != nil {
-		return fmt.Errorf("could not open firewall automatically: %v\nRun manually: %s", err, FirewallManualLine())
-	}
-	return nil
-}
-
-// FirewallManualLine returns the one-line ufw command to open the port.
-func FirewallManualLine() string {
-	return firewall.UFWRuleLine(FixedPort)
-}
-
-// RenderQR renders a pairing URI to ASCII-art QR for the terminal.
-func RenderQR(uri string) (string, error) {
-	qr, err := qrcode.New(uri, qrcode.Medium)
-	if err != nil {
-		return "", err
-	}
-	return qr.ToSmallString(true), nil
-}
-
-// StopDaemon stops the user service if it is running (non-fatal if not).
-func StopDaemon() error {
-	if _, err := service.Run(service.Stop); err != nil {
-		return nil
-	}
-	return nil
-}
-
-func ensureFirewall() (bool, string) {
-	if err := firewall.UFWAllow(FixedPort); err != nil {
-		return false, fmt.Sprintf("could not open firewall automatically: %v\nRun manually: %s", err, firewall.UFWRuleLine(FixedPort))
-	}
-	return true, ""
-}
-
-func lanIPs() []string {
-	var ips []string
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return nil
-	}
-	for _, iface := range ifaces {
-		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		for _, addr := range addrs {
-			if ip, ok := addr.(*net.IPNet); ok && !ip.IP.IsLoopback() {
-				if ip.IP.To4() != nil {
-					ips = append(ips, ip.IP.String())
-				}
-			}
-		}
-	}
-	return ips
 }
 
 func base64urlNoPad(src []byte) string {

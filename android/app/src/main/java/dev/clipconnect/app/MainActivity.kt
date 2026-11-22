@@ -1,48 +1,75 @@
 package dev.clipconnect.app
 
-import android.Manifest
 import android.content.Context
 import android.content.Intent
-import android.content.pm.PackageManager
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.platform.LocalContext
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.unit.dp
-import dev.clipconnect.app.service.ConnectionService
-import dev.clipconnect.app.service.IncomingClipApplier
 import dev.clipconnect.app.network.TcpClient
-import dev.clipconnect.app.setup.MiUiSetup
+import dev.clipconnect.app.service.ClipboardCapture
+import dev.clipconnect.app.service.readCurrentOnFocusGain
+import dev.clipconnect.app.service.onClipApplied
+import dev.clipconnect.app.service.ConnectionService
+import dev.clipconnect.app.service.SecretStore
+import java.util.concurrent.atomic.AtomicBoolean
+
 private const val TAG = "MainActivity"
 
-class MainActivity : ComponentActivity() {
-    // Bound service connections, tracked so they can be unbound on destroy.
-    private val bindConnections = mutableListOf<android.content.ServiceConnection>()
+/**
+ * Hosts pairing UI, the connection service binding, and focus-gated outgoing
+ * clipboard capture.
+ *
+ * Capture model (honest about Android 10+ focus restrictions):
+ *  - Outgoing clipboard capture is event-driven and only runs while this Activity
+ *    holds window focus. [ClipboardCapture] registers its listener on focus gain and
+ *    unregisters on focus loss, so we never pretend to monitor the clipboard while
+ *    backgrounded.
+ *  - Incoming clips (laptop -> phone) keep working regardless of focus because the
+ *    TCP connection lives in a background service.
+ *  - [captureActive] reflects whether outgoing capture is currently enabled; the UI
+ *    shows it so users understand why a backgrounded copy may not sync.
+ */
+class MainActivity : ComponentActivity(), ClipboardCapture.FocusOwner {
+
+    internal val bindConnections = mutableListOf<android.content.ServiceConnection>()
+    private val handler = Handler(Looper.getMainLooper())
+
+    // captureActive tracks whether outgoing clipboard capture is currently enabled
+    // (window focus held). Exposed to the UI for honest status.
+    private val captureActive = AtomicBoolean(false)
+
+    // The TcpClient from the bound service, set in onServiceConnected.
+    internal var boundTcpClient: TcpClient? = null
+
+    private lateinit var clipboardCapture: ClipboardCapture
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContent {
-            MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
-                    MainScreen(this@MainActivity)
-                }
-            }
+
+        clipboardCapture = ClipboardCapture(
+            this,
+            { tcpClientForBinding() },
+        ) { chars ->
+            // Transient confirmation that a copy was sent. Length-only: never
+            // surfaces clipboard content.
+            android.widget.Toast.makeText(
+                applicationContext,
+                applicationContext.getString(dev.clipconnect.app.R.string.clip_sent, chars),
+                android.widget.Toast.LENGTH_SHORT,
+            ).show()
         }
+        // Let IncomingClipApplier mark laptop-applied clips as already-sent so
+        // the outgoing capture never echoes them back.
+        ClipboardCapture.registerAppliedListener { text -> clipboardCapture.onClipApplied(text) }
 
         // Handle deep link (QR scan result via URI)
         intent?.data?.let { uri ->
@@ -50,33 +77,54 @@ class MainActivity : ComponentActivity() {
                 handlePairingUri(uri.toString())
             }
         }
-    }
 
-    override fun onNewIntent(intent: Intent) {
-        super.onNewIntent(intent)
-        intent.data?.let { uri ->
-            if (uri.scheme == "clipconnect" && uri.host == "pair") {
-                handlePairingUri(uri.toString())
+        setContent {
+            MaterialTheme {
+                Surface(modifier = Modifier.fillMaxSize()) {
+                    MainScreen(this@MainActivity, captureActive.get())
+                }
             }
         }
     }
 
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            // Re-register listener and re-read current clipboard once so reopening the
+            // app captures the latest available content. Android has no clipboard
+            // history, so only the current value can be recovered.
+            clipboardCapture.onFocusGained(this)
+            clipboardCapture.readCurrentOnFocusGain()
+            captureActive.set(true)
+        } else {
+            clipboardCapture.onFocusLost()
+            captureActive.set(false)
+        }
+    }
+
+    override fun hasWindowFocus(): Boolean = super.hasWindowFocus()
+
     override fun onDestroy() {
-        super.onDestroy()
+        boundTcpClient = null
+        clipboardCapture.destroy()
         for (c in bindConnections) {
             try { unbindService(c) } catch (e: Throwable) { /* already unbound */ }
         }
         bindConnections.clear()
+        handler.removeCallbacksAndMessages(null)
+        super.onDestroy()
     }
 
+    // --- pairing storage / service wiring ---
+
     private fun handlePairingUri(uriStr: String) {
-        parsePairingUri(uriStr) { host, port, secret ->
+        parsePairingUri(this, uriStr) { host, port, secret ->
             savePairing(host, port, secret)
             startConnectionService(host, port, secret)
         }
     }
 
-    private fun parsePairingUri(rawValue: String, onPair: (host: String, port: Int, secret: ByteArray) -> Unit) {
+    internal fun parsePairingUri(activity: MainActivity, rawValue: String, onPair: (host: String, port: Int, secret: ByteArray) -> Unit) {
         try {
             val uri = Uri.parse(rawValue)
             if (uri.scheme != "clipconnect" || uri.host != "pair") {
@@ -97,421 +145,64 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun savePairing(host: String, port: Int, secret: ByteArray) {
+    internal fun savePairing(host: String, port: Int, secret: ByteArray) {
         val prefs = getSharedPreferences("clipconnect", Context.MODE_PRIVATE)
         prefs.edit().apply {
             putString("host", host)
             putInt("port", port)
-            putString("secret", android.util.Base64.encodeToString(secret, android.util.Base64.DEFAULT))
+            // Stable per-install identity so the laptop can key its durable
+            // outbox and replay unacknowledged clips across reconnects.
+            if (prefs.getString("phoneId", null) == null) {
+                putString("phoneId", generatePhoneId())
+            }
             apply()
         }
+        // Encrypt+persist the secret via Android Keystore (not plain storage).
+        SecretStore.save(this, secret)
     }
 
-    private fun startConnectionService(host: String, port: Int, secret: ByteArray) {
+    /** A stable, random per-install identity sent in the hello frame. */
+    private fun generatePhoneId(): String {
+        val bytes = ByteArray(12)
+        java.security.SecureRandom().nextBytes(bytes)
+        return android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+    }
+
+    /** The stable per-install identity, or null if not yet paired. */
+    private fun phoneId(): String? =
+        getSharedPreferences("clipconnect", Context.MODE_PRIVATE).getString("phoneId", null)
+
+    internal fun startConnectionService(host: String, port: Int, secret: ByteArray) {
         val intent = Intent(this, ConnectionService::class.java).apply {
             putExtra(ConnectionService.EXTRA_HOST, host)
             putExtra(ConnectionService.EXTRA_PORT, port)
             putExtra(ConnectionService.EXTRA_SECRET, secret)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
-        }
+        startService(intent) // plain background service; capture is focus-gated
     }
 
-    /**
-     * Bind to the ConnectionService to obtain the shared TcpClient. The service
-     * is the single owner of the network connection; binding lets the Activity
-     * observe the listener without a static holder.
-     */
-    private fun stopConnectionService() {
-        val intent = Intent(this, ConnectionService::class.java)
-        stopService(intent)
+    internal fun stopConnectionService() {
+        stopService(Intent(this, ConnectionService::class.java))
     }
 
-    private fun clearPairing() {
+    /** Returns the bound TcpClient, or null if not yet bound. */
+    private fun tcpClientForBinding(): TcpClient? = boundTcpClient
+
+    internal fun clearPairing() {
         getSharedPreferences("clipconnect", Context.MODE_PRIVATE).edit().clear().apply()
+        SecretStore.clear(this)
     }
 
-    private fun loadPairing(): Pair<String, Int>? {
+    internal fun loadPairing(): Pair<String, Int>? {
         val prefs = getSharedPreferences("clipconnect", Context.MODE_PRIVATE)
         val host = prefs.getString("host", null) ?: return null
         val port = prefs.getInt("port", 0)
         return Pair(host, port)
     }
 
-    private fun loadSecret(): ByteArray? {
-        val prefs = getSharedPreferences("clipconnect", Context.MODE_PRIVATE)
-        val secretB64 = prefs.getString("secret", null) ?: return null
-        return android.util.Base64.decode(secretB64, android.util.Base64.DEFAULT)
-    }
+    internal fun loadSecret(): ByteArray? = SecretStore.load(this)
 
-    private val notificationPermissionLauncher = registerForActivityResult(
+    private val qrPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) {}
-
-    private val localNetworkPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) {}
-
-    @OptIn(ExperimentalMaterial3Api::class)
-    @Composable
-    fun MainScreen(activity: MainActivity) {
-        var connectionStatus by remember { mutableStateOf("Disconnected") }
-        var pairedHost by remember { mutableStateOf("") }
-        var pairedPort by remember { mutableIntStateOf(0) }
-        var showPairingDialog by remember { mutableStateOf(false) }
-        var showScanner by remember { mutableStateOf(false) }
-        var checkNotificationPermission by remember { mutableStateOf(false) }
-        var checkLocalNetwork by remember { mutableStateOf(false) }
-        var batteryPromptShown by remember { mutableStateOf(false) }
-        var tcpClient by remember { mutableStateOf<TcpClient?>(null) }
-        var syncing by remember { mutableStateOf(false) }
-
-        // Single coroutine scope for off-main clipboard work. Cancelled on stop.
-        val uiScope = remember { CoroutineScope(Dispatchers.Main) }
-
-        // Load saved pairing on first composition
-        LaunchedEffect(Unit) {
-            val pairing = activity.loadPairing()
-            if (pairing != null) {
-                pairedHost = pairing.first
-                pairedPort = pairing.second
-                connectionStatus = "Connecting…"
-            }
-
-            // Start connection service if paired
-            if (pairing != null) {
-                val secret = activity.loadSecret()
-                if (secret != null) {
-                    activity.startConnectionService(pairing.first, pairing.second, secret)
-                }
-            }
-        }
-
-        // mDNS discovery was removed: the phone connects to the IP shown on the
-        // laptop QR (or the manual field) and reconnects via TcpClient's built-in
-        // backoff. No background discovery thread.
-
-        // Outgoing sync (phone -> laptop) is fully automated: the ConnectionService
-        // polls the clipboard via an in-process IPC server every ~800ms and sends
-        // changed clips to the laptop. No manual launch or tap is required.
-
-        // Request notification permission (Android 13+)
-        if (checkNotificationPermission && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            checkNotificationPermission = false
-            notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
-        // Request local network permission (Android 17+, API 37+)
-        if (checkLocalNetwork && Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-            checkLocalNetwork = false
-            localNetworkPermissionLauncher.launch("android.permission.ACCESS_LOCAL_NETWORK")
-        }
-
-        // Show battery optimization prompt once
-        if (batteryPromptShown && Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            batteryPromptShown = false
-            try {
-                val pm = activity.getSystemService(android.content.Context.POWER_SERVICE) as android.os.PowerManager
-                if (!pm.isIgnoringBatteryOptimizations(activity.packageName)) {
-                    val intent = Intent().apply {
-                        action = Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
-                        data = Uri.parse("package:${activity.packageName}")
-                    }
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    activity.startActivity(intent)
-                }
-            } catch (e: Exception) {
-                Log.d(TAG, "Battery optimization dialog failed: ${e.message}")
-            }
-        }
-
-        // Bind to the ConnectionService to receive its TcpClient and wire the
-        // listener once. The service is the single owner of the network
-        // connection; the Activity only observes and applies incoming clips.
-        val context = LocalContext.current
-
-        LaunchedEffect(Unit) {
-            val svcConnection = object : android.content.ServiceConnection {
-                override fun onServiceConnected(
-                    name: android.content.ComponentName,
-                    service: android.os.IBinder
-                ) {
-                    val binder = service as ConnectionService.LocalBinder
-                    val svc = binder.getService()
-                    val client = svc.tcpClientForBinding()
-                    tcpClient = client
-                    client.setListener(object : TcpClient.Listener {
-                        override fun onConnected() {
-                            connectionStatus = "Connected"
-                            IncomingClipApplier.attach(IncomingClipApplier())
-                            Log.d(TAG, "UI: Connected")
-                        }
-                        override fun onDisconnected(reason: String) {
-                            connectionStatus = "Disconnected: $reason"
-                            Log.d(TAG, "UI: Disconnected: $reason")
-                        }
-                        override fun onMessage(text: String) {
-                            uiScope.launch(Dispatchers.IO) {
-                                IncomingClipApplier.apply(this@MainActivity, text)
-                            }
-                            Log.d(TAG, "Received clip from laptop: ${text.length} chars")
-                        }
-                        override fun onError(error: String) {
-                            connectionStatus = "Error: $error"
-                            Log.e(TAG, "UI: Error: $error")
-                        }
-                    })
-                    // Reflect current connection state immediately (covers the
-                    // case where we bound after already being connected).
-                    if (client.isConnected) {
-                        connectionStatus = "Connected"
-                        IncomingClipApplier.attach(IncomingClipApplier())
-                    }
-                    Log.d(TAG, "Bound TcpClient (connected=${client.isConnected})")
-                }
-                override fun onServiceDisconnected(name: android.content.ComponentName) {
-                    connectionStatus = "Disconnected: service unbound"
-                }
-            }
-            bindService(Intent(this@MainActivity, ConnectionService::class.java), svcConnection, Context.MODE_PRIVATE)
-            bindConnections += svcConnection
-        }
-
-        // Single source of truth for the status label: collect the service's
-        // connection StateFlow. This is robust to listener-attach timing — even
-        // if onConnected()/onDisconnected() fire before or after we bind, the
-        // status always reflects what the service actually reports.
-        LaunchedEffect(Unit) {
-            ConnectionService.connectionState.collect { connected ->
-                connectionStatus = if (connected) "Connected" else "Disconnected"
-            }
-        }
-
-        fun doPair(host: String, port: Int, secret: ByteArray) {
-            pairedHost = host
-            pairedPort = port
-            connectionStatus = "Connecting..."
-            activity.savePairing(host, port, secret)
-            activity.startConnectionService(host, port, secret)
-        }
-
-        fun doUnpair() {
-            activity.clearPairing()
-            activity.stopConnectionService()
-            pairedHost = ""
-            pairedPort = 0
-            connectionStatus = "Disconnected"
-            tcpClient = null
-        }
-
-        Scaffold(topBar = { TopAppBar(title = { Text("ClipConnect") }) }) { padding ->
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(padding)
-                    .padding(16.dp)
-                    .verticalScroll(rememberScrollState()),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.Top
-            ) {
-                // Connection status card
-                Card(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("Connection", style = MaterialTheme.typography.titleMedium)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            CircularProgressIndicator(
-                                progress = if (connectionStatus == "Connected") 1f else 0f,
-                                modifier = Modifier.size(24.dp)
-                            )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Text(connectionStatus, style = MaterialTheme.typography.bodyLarge)
-                        }
-                    }
-                }
-
-                // Pair card
-                Card(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("Pair", style = MaterialTheme.typography.titleMedium)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        if (pairedHost.isEmpty()) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp)
-                            ) {
-                                Button(
-                                    onClick = { showPairingDialog = true },
-                                    modifier = Modifier.weight(1f)
-                                ) { Text("Manual") }
-                                Button(
-                                    onClick = { showScanner = true },
-                                    modifier = Modifier.weight(1f)
-                                ) { Text("QR") }
-                            }
-                        } else {
-                            Text(
-                                "Paired: $pairedHost:$pairedPort",
-                                style = MaterialTheme.typography.bodyMedium
-                            )
-                            Spacer(modifier = Modifier.height(8.dp))
-                            OutlinedButton(onClick = {
-                                showPairingDialog = true
-                            }, modifier = Modifier.fillMaxWidth()) {
-                                Text("Update")
-                            }
-                            Spacer(modifier = Modifier.height(4.dp))
-                            OutlinedButton(onClick = { doUnpair() }, modifier = Modifier.fillMaxWidth()) {
-                                Text("Unpair")
-                            }
-                        }
-                    }
-                }
-
-                // Sync to Laptop (phone -> laptop) card — fully automated.
-                Card(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("Sync to Laptop", style = MaterialTheme.typography.titleMedium)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            "Your phone clipboard is read automatically and sent to the laptop over the LAN. Changes appear within ~1 second.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            "Mode: automatic (continuous)",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                    }
-                }
-
-                // Setup checklist — state + deep-link + App-info fallback.
-                // Re-checked every app start via MiUiSetup.rows().
-                val setupRows = MiUiSetup.rows(activity)
-                Card(modifier = Modifier.fillMaxWidth().padding(bottom = 16.dp)) {
-                    Column(modifier = Modifier.padding(16.dp)) {
-                        Text("Survival Checklist (MIUI/HyperOS)", style = MaterialTheme.typography.titleMedium)
-                        Spacer(modifier = Modifier.height(8.dp))
-                        Text(
-                            "Keep these on so the connection survives background and reboot.",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                        Spacer(modifier = Modifier.height(8.dp))
-                        for (row in setupRows) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    if (row.ok) "✓ " else "✗ ",
-                                    color = if (row.ok) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
-                                    style = MaterialTheme.typography.bodyMedium
-                                )
-                                Text(row.label, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f))
-                                if (!row.ok && row.intent != null) {
-                                    TextButton(onClick = {
-                                        try {
-                                            activity.startActivity(row.intent)
-                                        } catch (e: Throwable) {
-                                            Log.d(TAG, "deep-link failed: ${e.message}")
-                                        }
-                                    }) { Text("Open") }
-                                } else if (!row.ok) {
-                                    Text("manual", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                }
-                            }
-                            Spacer(modifier = Modifier.height(4.dp))
-                        }
-                    }
-                }
-            }
-        }
-
-        if (showScanner) {
-            ScannerOverlay(
-                onDismiss = { showScanner = false },
-                onResult = { uriStr ->
-                    parsePairingUri(uriStr) { host, port, secret ->
-                        doPair(host, port, secret)
-                    }
-                }
-            )
-        }
-
-        if (showPairingDialog) {
-            PairingDialog(
-                onDismiss = { showPairingDialog = false },
-                onPair = { h, p, s -> doPair(h, p, s) },
-                currentHost = pairedHost,
-                currentPort = pairedPort
-            )
-        }
-    }
-
-    @Composable
-    fun PairingDialog(
-        onDismiss: () -> Unit,
-        onPair: (host: String, port: Int, secret: ByteArray) -> Unit,
-        currentHost: String,
-        currentPort: Int
-    ) {
-        var host by remember { mutableStateOf(currentHost) }
-        var port by remember { mutableStateOf(if (currentPort > 0) currentPort.toString() else "10369") }
-        var secret by remember { mutableStateOf("") }
-
-        AlertDialog(
-            onDismissRequest = { onDismiss() },
-            title = { Text("Manual Pair") },
-            text = {
-                Column {
-                    OutlinedTextField(
-                        value = host,
-                        onValueChange = { host = it },
-                        label = { Text("IP") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = port,
-                        onValueChange = { port = it },
-                        label = { Text("Port") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = secret,
-                        onValueChange = { secret = it },
-                        label = { Text("Secret (base64url)") },
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-            },
-            confirmButton = {
-                Button(onClick = {
-                    if (host.isNotBlank() && secret.isNotBlank()) {
-                        val b64 = secret.replace('-', '+').replace('_', '/')
-                        val padded = when (b64.length % 4) {
-                            2 -> b64 + "=="
-                            3 -> b64 + "="
-                            else -> b64
-                        }
-                        val decoded = android.util.Base64.decode(padded.trim(), android.util.Base64.DEFAULT)
-                        if (decoded.isNotEmpty()) {
-                            onPair(host, port.toIntOrNull() ?: 10369, decoded)
-                        }
-                    }
-                }) { Text("Pair") }
-            },
-            dismissButton = {
-                TextButton(onClick = onDismiss) { Text("Cancel") }
-            }
-        )
-    }
 }
-

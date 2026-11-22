@@ -14,12 +14,11 @@ class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
 
-        // Restore pairing from shared preferences
+        // Restore pairing from shared preferences; secret from Keystore-backed store.
         val prefs = context.getSharedPreferences("clipconnect", Context.MODE_PRIVATE)
         val host = prefs.getString("host", null) ?: return
         val port = prefs.getInt("port", 0)
-        val secretB64 = prefs.getString("secret", null) ?: return
-        val secret = android.util.Base64.decode(secretB64, android.util.Base64.DEFAULT)
+        val secret = dev.clipconnect.app.service.SecretStore.load(context) ?: return
 
         // Restart the connection service
         val serviceIntent = Intent(context, ConnectionService::class.java).apply {

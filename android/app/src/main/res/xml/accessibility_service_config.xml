@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Accessibility service config for the clipboard-preview PoC.
+
+  - eventTypes: window change + clipboard events. (typeWindowsChanged is not a
+    valid accessibility event type; window content/state changes fire on their
+    own when the overlay updates.)
+  - flags: flagRetrieveInteractiveWindows lets us read interactive nodes in the
+    SystemUI overlay's tree even though the triggering event comes from another
+    package.
+  - feedbackType GENERIC: we don't produce audio/haptic feedback; we read nodes.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true" />

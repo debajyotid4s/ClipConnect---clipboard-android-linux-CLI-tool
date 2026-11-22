@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
 // qrSource abstracts QR generation so the view can be tested without a real
@@ -178,18 +176,3 @@ func formatUptime(d time.Duration, now time.Time) string {
 	}
 	return fmt.Sprintf("%ds", s)
 }
-
-var (
-	dash        = "—"
-	headerStyle = lipgloss.NewStyle().
-			Bold(true).
-			Background(lipgloss.Color("#33415c")).
-			Foreground(lipgloss.Color("#ffffff")).
-			Padding(0, 1)
-	mutedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#8a93a3"))
-	greenStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#46c88c"))
-	redStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#ee6482"))
-	activeStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("#f5d76e"))
-	helpStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("#8a93a3"))
-	qrStyle     = lipgloss.NewStyle().Padding(0, 1)
-)

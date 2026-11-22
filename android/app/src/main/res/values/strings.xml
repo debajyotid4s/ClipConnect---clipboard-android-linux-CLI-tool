@@ -1,4 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="ime_name">ClipConnect</string>
+    <string name="acc_poc_label">Accessibility preview PoC</string>
+    <string name="acc_poc_desc">Enables the accessibility proof-of-concept that logs the SystemUI clipboard preview window tree. Must be turned on in Accessibility settings.</string>
+    <string name="clip_sent">Sent %1$d chars to laptop</string>
 </resources>

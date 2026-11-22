@@ -8,7 +8,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/clip"
 	"github.com/debajyotid4s/ClipConnect---clipboard-android-linux-CLI-tool/laptop/internal/session"
 )
 
@@ -30,35 +29,20 @@ func portFromAddr(addr string) (int, error) {
 	return p, err
 }
 
-// Server listens for incoming connections and manages sessions.
-type Server struct {
-	addr    string
-	secret  []byte
-	handler Handler
-	onEstablished OnEstablished
-	logger  *slog.Logger
-	port    int
-
-	// ln is stored so Start can close it on shutdown, which unblocks Accept()
-	// (a plain ctx cancel does not stop a blocking Accept).
-	ln   net.Listener
-	mu   sync.Mutex
-	clients map[*session.Session]bool
-
-	// Per-client seq tracking
-	seqMu     sync.Mutex
-	clientSeq map[string]uint64
-}
-
 // New creates a new server.
 func New(addr string, secret []byte, handler Handler, logger *slog.Logger) *Server {
 	return &Server{
-		addr:       addr,
-		secret:     secret,
-		handler:    handler,
-		logger:     logger,
-		clients:    make(map[*session.Session]bool),
-		clientSeq:  make(map[string]uint64),
+		addr:           addr,
+		secret:         secret,
+		handler:        handler,
+		logger:         logger,
+		clients:        make(map[*session.Session]bool),
+		clientSeq:      make(map[string]uint64),
+		ackedSeq:       make(map[string]uint64),
+		outbox:         make(map[string]*phoneOutbox),
+		outboxGrace:    15 * time.Minute,
+		reaperInterval: 1 * time.Minute,
+		stopReaper:     make(chan struct{}),
 	}
 }
 
@@ -93,8 +77,8 @@ func (s *Server) Start(ctx context.Context) error {
 		s.ln = nil
 		s.mu.Unlock()
 		ln.Close()
+		s.Stop()
 	}()
-
 	var wg sync.WaitGroup
 	defer func() {
 		wg.Wait()
@@ -104,6 +88,10 @@ func (s *Server) Start(ctx context.Context) error {
 		}
 		s.mu.Unlock()
 	}()
+
+	// Start the outbox reaper so orphaned outboxes (phones that disconnected and
+	// never came back, or came back under a fresh id) are eventually freed.
+	go s.reaperLoop()
 
 	for {
 		conn, err := ln.Accept()
@@ -148,6 +136,7 @@ func (s *Server) Close() error {
 	return err
 }
 
+// handleConn accepts one connection: handshake, outbox replay, then read/ping.
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) error {
 	defer conn.Close()
 
@@ -171,6 +160,21 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) error {
 
 	s.logger.Info("session established", "addr", conn.RemoteAddr())
 
+	// Replay any durable clips that were not acknowledged before the phone
+	// disconnected. The id is the per-connection id the server minted on connect,
+	// so a reconnected phone (new id) cannot claim another phone's queue.
+	if cid := sess.ConnID(); cid != "" {
+		if clips := s.takeOutbox(cid); len(clips) > 0 {
+			s.logger.Info("replaying buffered clips", "count", len(clips), "cid", cid)
+			for _, c := range clips {
+				if err := sess.WriteMsg(&session.Message{Type: "clip", Text: c.text, Seq: c.seq}); err != nil {
+					s.logger.Error("replay clip", "err", err, "cid", cid)
+					return err
+				}
+			}
+		}
+	}
+
 	if s.onEstablished != nil {
 		s.onEstablished(conn.RemoteAddr().String())
 	}
@@ -186,116 +190,6 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) error {
 	go func() { defer wg.Done(); s.pingLoop(ctx, sess) }()
 
 	wg.Wait()
-	return nil
-}
-
-func (s *Server) readLoop(ctx context.Context, sess *session.Session) {
-	msgCount := 0
-
-
-	// buf := make([]byte, 1024)
-	// for {
-	// 	n, err := conn.Read(buf)
-	// 	buf = buf[n:]
-	// }
-
-
-	for {
-		sess.SetReadDeadline(time.Now().Add(45 * time.Second))
-
-		msg, err := sess.ReadMsg()
-		if err != nil {
-			s.logger.Info("read error", "err", err, "addr", sess.RemoteAddr())
-			return
-		}
-
-		sess.SetReadDeadline(time.Time{})
-		msgCount++
-		s.logger.Info("read msg", "type", msg.Type, "count", msgCount, "addr", sess.RemoteAddr())
-
-		switch msg.Type {
-		case "clip":
-			if clip.IsEmptyOrTooLarge(msg.Text) {
-				continue
-			}
-			if clip.IsSensitive(msg.Text) {
-				continue
-			}
-
-		// Seq/ack: track sequence number
-			s.seqMu.Lock()
-			if msg.Seq > 0 {
-				addr := sess.RemoteAddr()
-				s.clientSeq[addr] = msg.Seq
-			}
-			s.seqMu.Unlock()
-
-			if s.handler != nil {
-				s.handler(msg.Text)
-			}
-			s.sendAck(sess, msg.Seq)
-		case "ack":
-			s.logger.Info("received ack", "seq", msg.Seq, "addr", sess.RemoteAddr())
-		case "ping":
-			if err := sess.WriteMsg(&session.Message{Type: "pong"}); err != nil {
-				s.logger.Error("write pong", "err", err)
-				return
-			}
-		}
-	}
-}
-
-// sendAck sends an acknowledgment for a clip sequence number.
-func (s *Server) sendAck(sess *session.Session, seq uint64) {
-	if seq > 0 {
-		if err := sess.WriteMsg(&session.Message{Type: "ack", Seq: seq}); err != nil {
-			s.logger.Error("write ack", "err", err, "seq", seq)
-		}
-	}
-}
-
-func (s *Server) pingLoop(ctx context.Context, sess *session.Session) {
-	ticker := time.NewTicker(25 * time.Second)
-	defer ticker.Stop()
-	pingCount := 0
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			pingCount++
-			s.logger.Info("sending ping", "count", pingCount, "addr", sess.RemoteAddr())
-			sess.SetWriteDeadline(time.Now().Add(5 * time.Second))
-			if err := sess.WriteMsg(&session.Message{Type: "ping"}); err != nil {
-				s.logger.Error("ping failed", "err", err, "addr", sess.RemoteAddr())
-				return
-			}
-			sess.SetWriteDeadline(time.Time{})
-		}
-	}
-}
-
-// Send sends a clip to all connected clients with seq/ack.
-func (s *Server) Send(text string) error {
-	s.mu.Lock()
-	// Increment seq per client
-	for cl := range s.clients {
-		addr := cl.RemoteAddr()
-		s.seqMu.Lock()
-		seq := s.clientSeq[addr] + 1
-		s.clientSeq[addr] = seq
-		s.seqMu.Unlock()
-
-		msg := &session.Message{Type: "clip", Text: text, Seq: seq}
-		cl.SetWriteDeadline(time.Now().Add(5 * time.Second))
-		if err := cl.WriteMsg(msg); err != nil {
-			s.logger.Error("send clip", "err", err)
-			cl.Close()
-		}
-		cl.SetWriteDeadline(time.Time{})
-	}
-	s.mu.Unlock()
 	return nil
 }
 

@@ -2,25 +2,30 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="dev.clipconnect.app">
 
+    <!-- INTERNET: raw TCP to the laptop on the LAN. -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- CAMERA: in-app QR scanner for pairing (optional). -->
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
-    <!-- Foreground service permissions -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
-
-    <!-- Boot, battery, notifications -->
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
-    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!--
+      Permissions intentionally NOT declared (audited and removed):
+      - ACCESS_NETWORK_STATE : never read in code.
+      - WAKE_LOCK            : declared but never acquired.
+      - POST_NOTIFICATIONS   : we only build a notification channel for the
+                               foreground service; no notifications are posted.
+      - FOREGROUND_SERVICE*   : the connection service is no longer foreground;
+                               clipboard capture is event-driven and focus-gated,
+                               so it never needs to run while the app is backgrounded.
+      - REQUEST_IGNORE_BATTERY_OPTIMIZATIONS : cannot bypass clipboard focus rules
+                               and must not be requested "just in case".
+      - ACCESS_LOCAL_NETWORK : API 37+ only; not required for our TCP socket.
+    -->
 
     <application
         android:name=".ClipConnectApp"
-        android:allowBackup="true"
+        android:allowBackup="false"
         android:icon="@android:drawable/ic_dialog_info"
         android:label="ClipConnect"
         android:supportsRtl="true"
@@ -42,11 +47,12 @@
             </intent-filter>
         </activity>
 
-        <!-- Foreground service for connection -->
+        <!-- Connection service (now a plain background service). It only runs while
+             the Activity is foregrounded; clipboard reads require window focus, so a
+             foreground service would not extend capture. -->
         <service
             android:name=".service.ConnectionService"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:exported="false" />
 
         <receiver
             android:name=".BootReceiver"
@@ -55,6 +61,22 @@
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>
+
+        <!-- Accessibility PoC: logs the window tree on clipboard events so we can
+             tell whether the SystemUI clipboard preview exposes copied text to a
+             third-party service while the app is backgrounded. NOT wired into the
+             sync pipeline. Preserved per project requirement. -->
+        <service
+            android:name=".accessibility.AccessibilityClipCaptureService"
+            android:exported="false"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
 
     </application>
 </manifest>

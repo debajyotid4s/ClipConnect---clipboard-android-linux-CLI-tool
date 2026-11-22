@@ -9,40 +9,34 @@ import android.util.Log
 import dev.clipconnect.app.capture.ClipboardDedupe
 
 /**
- * Applies incoming clips from the laptop to the system clipboard.
+ * Applies incoming clips from the laptop to the system clipboard (laptop -> phone).
  *
- * The old accessibility service owned this path; with clipboard reading removed,
- * this lightweight holder keeps the laptop->phone write path alive and records
- * applied clips into the echo guard so they are never re-sent.
+ * The laptop writes the clip; we record its hash in an echo guard so the outgoing
+ * capture never re-sends it back. Writes are posted to the main looper because
+ * ClipboardManager writes must happen on the UI thread.
+ *
+ * Clipboard plaintext is only ever handed to the system clipboard; it is never
+ * logged. This class is stateless apart from a small echo cache and takes its
+ * context explicitly, so it never holds a leaked Activity reference.
  */
-class IncomingClipApplier {
+class IncomingClipApplier(private val context: Context) {
     companion object {
         private const val TAG = "IncomingClip"
-
-        @Volatile
-        private var instance: IncomingClipApplier? = null
-
-        fun attach(applier: IncomingClipApplier) {
-            instance = applier
-        }
-
-        fun apply(context: Context, text: String) {
-            instance?.apply(context, text)
-        }
     }
 
     private val dedupe = ClipboardDedupe()
 
-    fun apply(context: Context, text: String) {
+    fun apply(text: String) {
         Handler(Looper.getMainLooper()).post {
             try {
                 val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                 val clip = ClipData.newPlainText("ClipConnect", text)
                 clipboard.setPrimaryClip(clip)
                 Log.d(TAG, "Applied clip from laptop: ${text.length} chars")
-
-                val hash = dedupe.hash(text)
-                dedupe.recordApplied(hash)
+                dedupe.recordApplied(dedupe.hash(text))
+                // Mark it as already-sent on the outgoing side so the phone never
+                // echoes this clip back to the laptop (deterministic echo guard).
+                ClipboardCapture.fireApplied(text)
             } catch (e: Exception) {
                 Log.e(TAG, "Error writing received clip: ${e.message}")
             }

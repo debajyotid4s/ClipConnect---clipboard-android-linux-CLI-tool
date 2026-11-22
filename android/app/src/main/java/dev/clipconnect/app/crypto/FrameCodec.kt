@@ -6,6 +6,8 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * Handles encryption/decryption of frames using AES-256-GCM.
@@ -37,10 +39,9 @@ class FrameCodec(private val key: ByteArray) {
         ByteBuffer.wrap(result).order(ByteOrder.BIG_ENDIAN).putInt(cipherLen)
 
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        val nonce = buildNonce(counter)
+        val spec = GCMParameterSpec(128, buildNonce(counter))
         counter++
-        val spec = javax.crypto.spec.GCMParameterSpec(128, nonce)
-        cipher.init(Cipher.ENCRYPT_MODE, javax.crypto.spec.SecretKeySpec(key, "AES"), spec)
+        cipher.init(Cipher.ENCRYPT_MODE, SecretKeySpec(key, "AES"), spec)
         // NO AAD
         val ciphertext = cipher.doFinal(plaintext)
         System.arraycopy(ciphertext, 0, result, HEADER_SIZE, ciphertext.size)
@@ -67,10 +68,9 @@ class FrameCodec(private val key: ByteArray) {
         val ciphertext = buf.copyOfRange(HEADER_SIZE, HEADER_SIZE + length)
 
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        val nonce = buildNonce(counter)
+        val spec = GCMParameterSpec(128, buildNonce(counter))
         counter++
-        val spec = javax.crypto.spec.GCMParameterSpec(128, nonce)
-        cipher.init(Cipher.DECRYPT_MODE, javax.crypto.spec.SecretKeySpec(key, "AES"), spec)
+        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), spec)
         // NO AAD
         return cipher.doFinal(ciphertext)
     }
@@ -101,13 +101,5 @@ class FrameCodec(private val key: ByteArray) {
         val frame = encode(plaintext)
         output.write(frame)
         output.flush()
-    }
-
-    private fun buildNonce(counter: Long): ByteArray {
-        return ByteBuffer.allocate(12).apply {
-            order(ByteOrder.BIG_ENDIAN)
-            position(4)
-            putLong(counter)
-        }.array()
     }
 }
