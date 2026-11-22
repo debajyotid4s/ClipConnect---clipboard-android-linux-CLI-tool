@@ -1,4 +1,6 @@
 # ClipConnect
+<img width="2752" height="1536" alt="featuring" src="https://github.com/user-attachments/assets/82e094c5-738f-4b16-a86b-03a6374aa24a" />
+
 
 **Apple ecosystem-alike, bidirectional clipboard sync between a Linux device and an Android device.**
 
