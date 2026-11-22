@@ -56,14 +56,20 @@ func phoneConnected() (string, bool) {
 	return "", true
 }
 
-// buildQR returns the current pairing URI (shown once on the pair tab).
+// buildQR renders the current pairing URI as ASCII-art QR for the terminal.
+// It returns an empty string when not paired.
 func buildQR() string {
 	secret, _ := config.LoadSecret()
 	if secret == nil {
 		return ""
 	}
 	hostname, _ := os.Hostname()
-	return pairing.BuildURIString(secret, lanIPs(), pairing.FixedPort, hostname)
+	uri := pairing.BuildURIString(secret, lanIPs(), pairing.FixedPort, hostname)
+	qrStr, err := pairing.RenderQR(uri)
+	if err != nil {
+		return ""
+	}
+	return qrStr
 }
 
 func lanIPs() []string {

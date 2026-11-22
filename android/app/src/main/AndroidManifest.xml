@@ -7,6 +7,7 @@
 
     <!-- CAMERA: in-app QR scanner for pairing (optional). -->
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.VIBRATE" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
     <!--
@@ -26,7 +27,7 @@
     <application
         android:name=".ClipConnectApp"
         android:allowBackup="false"
-        android:icon="@android:drawable/ic_dialog_info"
+        android:icon="@drawable/logo"
         android:label="ClipConnect"
         android:supportsRtl="true"
         android:theme="@style/Theme.ClipConnect">

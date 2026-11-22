@@ -63,6 +63,9 @@ internal fun TcpClient.handleAck(ackSeq: Long) {
         if (ackSeq > 0 && unackedClip?.seq == ackSeq) {
             unackedClip = null
             Log.d(TAG, "Ack received for seq=$ackSeq, cleared unacked")
+            // The laptop acknowledged a clip this phone sent. Fire the
+            // heartbeat so the UI confirms delivery with a red wave + vibration.
+            dev.clipconnect.app.Heartbeat.pulse()
         }
     }
 }

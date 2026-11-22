@@ -1,6 +1,8 @@
 package tui
 
 import (
+	"fmt"
+	"os"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -45,9 +47,29 @@ func Run(src StatusProvider, qr string, logs string, paired bool) error {
 	}()
 
 	m := NewModel(statusCh, qr, logs, paired)
+
+	// When stdout is not a TTY (piped, CI, or the shell can't open /dev/tty),
+	// the full-screen program cannot run. Render a single static frame so the
+	// status and QR are still visible instead of failing.
+	if !isTerminal() {
+		fmt.Println(m.View())
+		return nil
+	}
+
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		return err
+		fmt.Println(m.View())
+		return nil
 	}
 	return nil
+}
+
+// isTerminal reports whether stdout is an interactive terminal. When false the
+// full-screen Bubble Tea program cannot run, so Run renders a static frame.
+func isTerminal() bool {
+	f, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return f.Mode()&os.ModeCharDevice != 0
 }

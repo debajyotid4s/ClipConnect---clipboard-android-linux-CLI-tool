@@ -8,19 +8,34 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+// Palette inspired by the Claude Code terminal theme: a near-black blue-gray
+// background with soft light text and muted colored accents.
 var (
-	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("4;249")).Render
-	subtitleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("3")).Render
-	menuStyle     = lipgloss.NewStyle().PaddingLeft(2).Render
-	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("10")).Bold(true).PaddingLeft(2).Render
-	helpStyle     = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).Padding(1).MarginTop(1).Render
-	statusGood    = lipgloss.NewStyle().Foreground(lipgloss.Color("2")).Render
-	statusBad     = lipgloss.NewStyle().Foreground(lipgloss.Color("1")).Render
-	statusMuted   = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render
-	footerStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("7")).Render
+	bg        = lipgloss.Color("#1a1b26") // main background
+	bgPanel   = lipgloss.Color("#222330") // cards / panels
+	text      = lipgloss.Color("#d4d4d4") // primary text
+	textDim   = lipgloss.Color("#8a8f98") // muted text
+	accent    = lipgloss.Color("#9ece6a") // green accent (connected / ok)
+	danger    = lipgloss.Color("#f7768e") // red accent (disconnected / bad)
+	info      = lipgloss.Color("#7aa2f7") // blue accent (labels / titles)
+	amber     = lipgloss.Color("#e0af68") // amber accent (warnings)
+	borderCol = lipgloss.Color("#363744") // panel borders
 )
 
-// View renders the current tab with Lip Gloss styling.
+var (
+	titleStyle    = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#bb9af7")).Padding(0, 1).Render
+	subtitleStyle = lipgloss.NewStyle().Foreground(textDim).Render
+	menuStyle     = lipgloss.NewStyle().Foreground(text).PaddingLeft(4).Render
+	selectedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(bg)).Bold(true).Background(lipgloss.Color(accent)).PaddingLeft(4).PaddingRight(1).Render
+	helpStyle     = lipgloss.NewStyle().Foreground(textDim).Background(lipgloss.Color(bgPanel)).Padding(1, 2).Render
+	statusGood    = lipgloss.NewStyle().Foreground(lipgloss.Color(accent)).Render
+	statusBad     = lipgloss.NewStyle().Foreground(lipgloss.Color(danger)).Render
+	statusMuted   = lipgloss.NewStyle().Foreground(textDim).Render
+	footerStyle   = lipgloss.NewStyle().Foreground(textDim).Render
+	panelStyle    = lipgloss.NewStyle().Background(lipgloss.Color(bgPanel)).Padding(1, 2).Border(lipgloss.RoundedBorder()).Render
+)
+
+// View renders the current tab with Claude-style dark theming.
 func (m model) View() string {
 	switch m.tab {
 	case tabPair:
@@ -39,7 +54,7 @@ func (m model) viewMain() string {
 	var b strings.Builder
 	b.WriteString(titleStyle("ClipConnect"))
 	b.WriteString("\n\n")
-	b.WriteString(subtitleStyle("A CLI-based tool for Android↔Linux automated synced clipboard sharing"))
+	b.WriteString(subtitleStyle("Android↔Linux synced clipboard"))
 	b.WriteString("\n\n")
 
 	items := menu()
@@ -65,16 +80,15 @@ func (m model) viewMain() string {
 // statusFooter renders a one-line connection summary.
 func (m model) statusFooter() string {
 	if !m.status.paired {
-		return statusMuted("Not paired yet — select \"Pair Android device\"")
+		return statusMuted("Not paired yet — choose \"Pair Android device\"")
 	}
 	if m.status.phoneConnected {
-		when := ""
 		if m.status.phoneIP != "" {
-			when = "  phone " + m.status.phoneIP
+			return statusGood("● Connected") + statusMuted("   phone " + m.status.phoneIP)
 		}
-		return statusGood("Paired • connected" + when)
+		return statusGood("Connected")
 	}
-	return statusBad("Paired • phone not connected")
+	return statusBad("○ Not connected")
 }
 
 // viewPair renders the QR and live connection status.
@@ -84,32 +98,39 @@ func (m model) viewPair() string {
 	b.WriteString("\n\n")
 
 	if m.qr != "" {
-		b.WriteString(m.qr)
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(text)).Render("Scan with the ClipConnect Android app:"))
 		b.WriteString("\n\n")
-		b.WriteString(statusMuted("Scan the QR with the ClipConnect Android app"))
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(text)).Background(lipgloss.Color(bg)).Padding(0, 1).Render(m.qr))
 		b.WriteString("\n\n")
 	}
 
-	// Live status block.
+	b.WriteString(panelStyle(m.connectionPanel()))
+
+	b.WriteString("\n\n")
+	b.WriteString(helpStyle("Press Esc to go back"))
+	return b.String()
+}
+
+// connectionPanel renders the connection status lines.
+func (m model) connectionPanel() string {
+	var b strings.Builder
 	if m.status.paired {
 		if m.status.phoneConnected {
-			b.WriteString(statusGood("● Connected"))
+			b.WriteString(statusGood("● Paired and connected"))
 		} else {
-			b.WriteString(statusBad("○ Waiting for phone…"))
+			b.WriteString(statusBad("○ Paired — phone not connected"))
 		}
-		b.WriteString("\n")
+	} else {
+		b.WriteString(statusMuted("○ Not paired"))
 	}
-
-	b.WriteString(fmt.Sprintf("  Port:        %d\n", m.status.port))
+	b.WriteString("\n")
+	b.WriteString(fmt.Sprintf("  %s %d\n", labelStyle("Port:"), m.status.port))
 	if m.status.phoneIP != "" {
-		b.WriteString(fmt.Sprintf("  Phone IP:    %s\n", m.status.phoneIP))
+		b.WriteString(fmt.Sprintf("  %s %s\n", labelStyle("Phone IP:"), m.status.phoneIP))
 	}
 	if m.status.uptime > 0 {
-		b.WriteString(fmt.Sprintf("  Uptime:      %s\n", formatUptime(m.status.uptime)))
+		b.WriteString(fmt.Sprintf("  %s %s\n", labelStyle("Uptime:"), formatUptime(m.status.uptime)))
 	}
-
-	b.WriteString("\n")
-	b.WriteString(helpStyle("Press Esc to go back"))
 	return b.String()
 }
 
@@ -121,7 +142,7 @@ func (m model) viewLogs() string {
 	if m.logs == "" {
 		b.WriteString(statusMuted("No logs available. Is the daemon running?"))
 	} else {
-		b.WriteString(truncate(m.logs, 24*40))
+		b.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color(text)).Render(truncate(m.logs, 24*60)))
 	}
 	b.WriteString("\n\n")
 	b.WriteString(helpStyle("Press Esc to go back"))
@@ -130,7 +151,12 @@ func (m model) viewLogs() string {
 
 // viewHelp renders the help/troubleshooting screen.
 func (m model) viewHelp() string {
-	return helpStyle(helpText)
+	return panelStyle(lipgloss.NewStyle().Foreground(lipgloss.Color(text)).Render(helpText))
+}
+
+// labelStyle renders a right-aligned key for status rows.
+func labelStyle(key string) string {
+	return lipgloss.NewStyle().Foreground(lipgloss.Color(info)).Width(len(key)).Render(key)
 }
 
 // truncate keeps the last n runes of s.

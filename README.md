@@ -151,9 +151,10 @@ No license file is currently included in this repository. Add or consult a proje
 
 Start the interactive CLI menu
 cd laptop
-go run ./cmd/clipconnect
+
 Pair an Android device
 go run ./cmd/clipconnect pair
+
 Other subcommands
 go run ./cmd/clipconnect status # paired / daemon / connection status
 go run ./cmd/clipconnect logs --lines 40 # daemon logs

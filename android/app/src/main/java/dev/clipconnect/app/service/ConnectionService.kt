@@ -1,7 +1,9 @@
 package dev.clipconnect.app.service
 
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -9,6 +11,7 @@ import android.os.IBinder
 import android.os.Binder
 import android.util.Log
 import dev.clipconnect.app.network.TcpClient
+import dev.clipconnect.app.ui.SyncEvent
 
 /**
  * Owns the encrypted TCP connection to the laptop for the life of the process.
@@ -22,6 +25,12 @@ import dev.clipconnect.app.network.TcpClient
  *
  * The service still exists so the socket survives Activity recreation (rotation,
  * process death) and so both directions share a single connection owner.
+ *
+ * State ownership: the service is the single source of truth for the link. It
+ * holds the authoritative [TcpClient.Listener] (so incoming clips are always
+ * applied) and publishes [connectionState] and [events] as flows. The UI observes
+ * these and never replaces the listener — doing so would silently stop incoming
+ * clips from being applied (see [onMessage]).
  */
 class ConnectionService : Service() {
 
@@ -35,9 +44,25 @@ class ConnectionService : Service() {
         private val _connectionState = MutableStateFlow(false)
         val connectionState = _connectionState.asStateFlow()
 
+        /** One-way lifecycle events the UI observes (connect/disconnect/error). */
+        private val _events = MutableSharedFlow<ConnectionEvent>(extraBufferCapacity = 8)
+        val events = _events.asSharedFlow()
+
+        /** Structured log lines emitted by the service, observed by Diagnostics. */
+        private val _log = MutableSharedFlow<String>(extraBufferCapacity = 32)
+        val log = _log.asSharedFlow()
+
         fun markConnected(value: Boolean) {
             _connectionState.value = value
         }
+    }
+
+    /** How the link transitioned; drives the ViewModel's [LinkState] machine. */
+    sealed interface ConnectionEvent {
+        data object Connected : ConnectionEvent
+        data class Disconnected(val reason: String) : ConnectionEvent
+        data class Error(val reason: String) : ConnectionEvent
+        data class Received(val chars: Int) : ConnectionEvent
     }
 
     inner class LocalBinder : Binder() {
@@ -64,22 +89,30 @@ class ConnectionService : Service() {
             if (!pid.isNullOrEmpty()) tcpClient.setPhoneId(pid)
             if (!isRunning) {
                 isRunning = true
+                // The service owns this listener for the life of the connection.
+                // It applies incoming clips so laptop -> phone sync always works,
+                // regardless of whether the UI is currently bound.
                 tcpClient.setListener(object : TcpClient.Listener {
                     override fun onConnected() {
                         markConnected(true)
+                        _events.tryEmit(ConnectionEvent.Connected)
                         Log.d(TAG, "connected to laptop")
                     }
                     override fun onDisconnected(reason: String) {
                         markConnected(false)
+                        _events.tryEmit(ConnectionEvent.Disconnected(reason))
                         Log.d(TAG, "disconnected: $reason")
                     }
                     override fun onMessage(text: String) {
                         applier.apply(text)
+                        _events.tryEmit(ConnectionEvent.Received(text.length))
                     }
                     override fun onError(error: String) {
+                        _events.tryEmit(ConnectionEvent.Error(error))
                         Log.e(TAG, "session error: $error")
                     }
                 })
+                _log.tryEmit("Connecting to $host:$port")
                 tcpClient.start()
             }
         }
@@ -88,7 +121,7 @@ class ConnectionService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = binder
 
-    /** Exposed to bound clients (the Activity) to read the shared TcpClient. */
+    /** Exposed to bound clients (the ViewModel) to read the shared TcpClient. */
     fun tcpClientForBinding(): TcpClient = tcpClient
 
     override fun onDestroy() {
